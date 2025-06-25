@@ -20,5 +20,6 @@ async fn main() {
         .expect("Failed to connect to Docker");
     // Here you would call your build function, e.g., build_program(&args.program);
     // For now, we just print the program name.
-    init_package_container(&args.program, docker).expect("Failed to initialize package container");
+    init_package_container(&args.program, docker).await
+        .expect("Failed to initialize package container");
 }
