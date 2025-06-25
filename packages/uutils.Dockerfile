@@ -29,4 +29,4 @@ RUN mkdir -p /output && \
 # Allow the output directory to be exported to host
 VOLUME ["/output"]
 
-LABEL output="/output/uutils.tar.gz"
+LABEL ship="/output/uutils.tar.gz"
