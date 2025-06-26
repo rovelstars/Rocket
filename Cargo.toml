@@ -6,5 +6,8 @@ edition = "2024"
 [dependencies]
 bollard = "0.19.1"
 clap = { version = "4.5.40", features = ["derive"] }
+colored = "3.0.0"
 futures-util = "0.3.31"
+reqwest = "0.12.20"
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+toml = "0.8.23"
