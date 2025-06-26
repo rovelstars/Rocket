@@ -1,7 +1,6 @@
-use bollard::Docker;
 use std::env;
 
-pub async fn init_package_container(package_name: &str, _docker: Docker) -> Result<(), String> {
+pub async fn init_package_container(package_name: &str) -> Result<(String, toml::Value), String> {
     let packages_dir = env::var("PACKAGES_DIR").map_err(|e| format!("PACKAGES_DIR not set: {}", e))?;
     let build_path = if packages_dir.starts_with("file://") {
         format!("{}/{}/BUILD", &packages_dir[7..], package_name)
@@ -20,12 +19,9 @@ pub async fn init_package_container(package_name: &str, _docker: Docker) -> Resu
         // Fallback to relative path
         format!("{}/{}/BUILD", packages_dir.trim_end_matches('/'), package_name)
     };
-    println!("Using BUILD path: {}", build_path);
     
     //meta.toml is in same directory as BUILD
     let meta_path = format!("{}/meta.toml", build_path.trim_end_matches("/BUILD"));
-    println!("Using meta.toml at: {}", meta_path);
-
 
     let build_content = if build_path.starts_with("https://") {
         // Download from URL
@@ -57,6 +53,6 @@ pub async fn init_package_container(package_name: &str, _docker: Docker) -> Resu
         }
     }
     let build_content = replaced_content;
-    println!("Parsed BUILD content:\n{}", build_content);
-    Ok(())
+
+    Ok((build_content, meta))
 }
