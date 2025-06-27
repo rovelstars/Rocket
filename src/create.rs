@@ -1,10 +1,9 @@
 #![allow(deprecated)]
 use std::io::Write;
 
-use bollard::{image::BuildImageOptions, secret::CreateImageInfo};
+use bollard::image::BuildImageOptions;
 use futures_util::TryStreamExt;
 use http_body_util::Full;
-use tokio_util::io::ReaderStream;
 
 pub async fn create_container(
     docker: &bollard::Docker,
@@ -43,7 +42,7 @@ pub async fn create_container(
         .build_image(
             BuildImageOptions {
                 dockerfile: "Dockerfile".to_string(),
-                t: "integration_test_build_image".to_string(),
+                t: container_name.to_string(),
                 pull: true,
                 rm: true,
                 ..Default::default()
