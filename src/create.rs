@@ -9,6 +9,7 @@ pub async fn create_container(
     docker: &bollard::Docker,
     build_script: &str,
     meta: &toml::Value,
+    patches: &Vec<(String, String)>
 ) -> Result<String, String> {
     println!("[create_container] build_script: {}", build_script);
 
@@ -23,16 +24,26 @@ pub async fn create_container(
         .unwrap_or("latest");
     let container_name = format!("{}-{}", name, version);
 
+       
     //create a tar archive of the build script, so it can be used to create a container
-
+    
     let mut header = tar::Header::new_gnu();
     header.set_path("Dockerfile").unwrap();
     header.set_size(build_script.len() as u64);
     header.set_mode(0o755);
     header.set_cksum();
     let mut tar = tar::Builder::new(Vec::new());
-    tar.append(&header, build_script.as_bytes()).unwrap();
 
+    // Add patches to the tar archive
+    for (patch_name, patch_content) in patches {
+        let mut patch_header = tar::Header::new_gnu();
+        patch_header.set_path(patch_name).unwrap();
+        patch_header.set_size(patch_content.len() as u64);
+        patch_header.set_mode(0o644);
+        patch_header.set_cksum();
+        tar.append(&patch_header, patch_content.as_bytes()).unwrap();
+    }
+    tar.append(&header, build_script.as_bytes()).unwrap();
     let uncompressed = tar.into_inner().unwrap();
     let mut c = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     c.write_all(&uncompressed).unwrap();
