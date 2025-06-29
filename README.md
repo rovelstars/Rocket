@@ -1,4 +1,4 @@
-# Rocket
+# Rocket 🚀
 
 Rocket is a Rust based CLI tool for managing Docker containers which compiles packages for our OS.
 The name "Rocket" is inspired by the whole Universe System, where each planet is a package and the rocket is the tool that helps us manage them. Gotta keep the astronauts happy 😏
