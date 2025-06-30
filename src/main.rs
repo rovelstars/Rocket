@@ -19,10 +19,12 @@ struct Args {
     program: String,
     #[arg(short, long, default_value = "false")]
     dry_run: bool,
-    #[arg(short, long, default_value = "false")]
+    #[arg(long, default_value = "false")]
     skip_copy_files: bool,
-    #[arg(short, long, default_value = "false")]
+    #[arg(long, default_value = "false")]
     skip_image_build: bool,
+    #[arg(short,long, default_value = "false")]
+    force: bool,
 }
 
 #[tokio::main]

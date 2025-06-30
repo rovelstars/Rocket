@@ -1,6 +1,8 @@
 use std::env;
 
-pub async fn init_package_container(package_name: &str) -> Result<(String, toml::Value, Vec<(String, String)>), String> {
+pub async fn init_package_container(
+    package_name: &str,
+) -> Result<(String, toml::Value, Vec<(String, String)>), String> {
     let packages_dir =
         env::var("PACKAGES_DIR").map_err(|e| format!("PACKAGES_DIR not set: {}", e))?;
     let build_path = if packages_dir.starts_with("file://") {
@@ -61,6 +63,16 @@ pub async fn init_package_container(package_name: &str) -> Result<(String, toml:
         toml::from_str(&meta_content).map_err(|e| format!("Failed to parse meta.toml: {}", e))?;
     // Replace all placeholders in build_content with values from meta
     let mut replaced_content = build_content.clone();
+    // If meta.branch is not set, set it to meta.version
+    let mut meta = meta;
+    if let Some(table) = meta.as_table_mut() {
+        if !table.contains_key("branch") {
+            if let Some(version) = table.get("version").and_then(|v| v.as_str()) {
+                table.insert("branch".to_string(), toml::Value::String(version.to_string()));
+            }
+        }
+    }
+
     if let Some(table) = meta.as_table() {
         for (key, value) in table {
             if let Some(val_str) = value.as_str() {
@@ -73,17 +85,23 @@ pub async fn init_package_container(package_name: &str) -> Result<(String, toml:
     //if patches folder exists, copy all the files and store it in array that can be passed back
     let patches_path = format!("{}/patches", build_path.trim_end_matches("/BUILD"));
     let mut patches = Vec::new();
-    let collect_patches = |dir: &std::path::Path, patches: &mut Vec<(String, String)>| -> Result<(), String> {
+    let collect_patches = |dir: &std::path::Path,
+                           patches: &mut Vec<(String, String)>|
+     -> Result<(), String> {
         fn inner(
             dir: &std::path::Path,
             patches: &mut Vec<(String, String)>,
             patches_path: &std::path::Path,
-            collect_patches: &dyn Fn(&std::path::Path, &mut Vec<(String, String)>) -> Result<(), String>,
+            collect_patches: &dyn Fn(
+                &std::path::Path,
+                &mut Vec<(String, String)>,
+            ) -> Result<(), String>,
         ) -> Result<(), String> {
             for entry in std::fs::read_dir(dir)
                 .map_err(|e| format!("Failed to read patches directory: {}", e))?
             {
-                let entry = entry.map_err(|e| format!("Failed to read entry in patches directory: {}", e))?;
+                let entry = entry
+                    .map_err(|e| format!("Failed to read entry in patches directory: {}", e))?;
                 let path = entry.path();
                 if path.is_file() {
                     let file_name = path
@@ -101,7 +119,11 @@ pub async fn init_package_container(package_name: &str) -> Result<(String, toml:
             Ok(())
         }
         let patches_path = std::path::Path::new(&patches_path);
-        inner(dir, patches, patches_path, &|d, p| inner(d, p, patches_path, &|d, p| inner(d, p, patches_path, &|_, _| Ok(()))))
+        inner(dir, patches, patches_path, &|d, p| {
+            inner(d, p, patches_path, &|d, p| {
+                inner(d, p, patches_path, &|_, _| Ok(()))
+            })
+        })
     };
 
     if std::path::Path::new(&patches_path).exists() {
