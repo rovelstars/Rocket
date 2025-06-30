@@ -9,9 +9,9 @@ pub async fn create_container(
     docker: &bollard::Docker,
     build_script: &str,
     meta: &toml::Value,
-    patches: &Vec<(String, String)>
+    patches: &Vec<(String, String)>,
+    dry_run: &bool,
 ) -> Result<String, String> {
-    println!("[create_container] build_script: {}", build_script);
 
     // Create a container with the build script and metadata
     let name = meta
@@ -22,7 +22,7 @@ pub async fn create_container(
         .get("version")
         .and_then(|v| v.as_str())
         .unwrap_or("latest");
-    let container_name = format!("{}-{}", name, version);
+    let container_name = format!("{}:{}", name, version);
 
        
     //create a tar archive of the build script, so it can be used to create a container
@@ -48,7 +48,10 @@ pub async fn create_container(
     let mut c = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     c.write_all(&uncompressed).unwrap();
     let compressed = c.finish().unwrap();
-
+    if *dry_run {
+        println!("[create_container] Dry run enabled, not creating container.");
+        return Ok(format!("{}:{}", name, version));
+    }
     let result = &docker
         .build_image(
             BuildImageOptions {
@@ -68,12 +71,12 @@ pub async fn create_container(
 
     // If all went well, the ID of the new image will be printed
     println!(
-        "[create_container] Created image: {:?}\n{}-{}",
+        "[create_container] Created image: {:?}\n{}:{}",
         &result[0], name, version
     );
 
     Ok(format!(
-        "{}-{}",
+        "{}:{}",
         meta.get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown"),

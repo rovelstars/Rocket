@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //return back list of images by name filter, using bollard.
 
 pub async fn list_images(
@@ -5,25 +6,26 @@ pub async fn list_images(
     name: &str,
     version: &str,
 ) -> Result<String, String> {
-    let filters = serde_json::json!({
-        "reference": [format!("{}:{}", name, version)],
+    use bollard::image::ListImagesOptions;
+
+    let options = Some(ListImagesOptions {
+        all: true,
+        filters: {
+            let mut map = std::collections::HashMap::new();
+            map.insert("reference".to_string(), vec![format!("{}:{}", name, version)]);
+            map
+        },
+        ..Default::default()
     });
 
-    let images = docker
-        .list_images(
-            None,
-            Some(bollard::image::ListImagesOptions {
-                all: true,
-                filters: Some(filters),
-            }),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if images.is_empty() {
-        return Err(format!("No images found for {}:{}", name, version));
+    match docker.list_images(options).await {
+        Ok(images) => {
+            let image_list: Vec<String> = images
+                .into_iter()
+                .map(|img| img.repo_tags.join(", "))
+                .collect();
+            Ok(image_list.join("\n"))
+        }
+        Err(e) => Err(format!("Failed to list images: {}", e)),
     }
-
-    // Return the first image's ID as a string
-    Ok(images[0].id.clone())
 }
