@@ -1,17 +1,12 @@
 [package]
 name = "rocket"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "RunixOS package builder using Linux namespaces"
 
 [dependencies]
-bollard = "0.19.1"
-clap = { version = "4.5.40", features = ["derive"] }
-colored = "3.0.0"
-flate2 = "1.1.2"
-futures-util = "0.3.31"
-http-body-util = { version = "0.1.3", features = ["full"] }
-reqwest = "0.12.20"
-tar = "0.4.44"
-tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
-tokio-util = { version = "0.7.15", features = ["io"] }
-toml = "0.8.23"
+clap = { version = "4.5", features = ["derive"] }
+colored = "3.0"
+nix = { version = "0.30", features = ["sched", "mount", "hostname", "signal", "fs", "process", "user"] }
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
