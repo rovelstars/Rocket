@@ -1,13 +1,12 @@
-use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{chroot, chdir, sethostname};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-/// Mount points to bind into the sandbox
+/// Mount points to bind into the sandbox (non-recursive to avoid capturing submounts)
 const BIND_MOUNTS: &[(&str, &str)] = &[
-    ("/dev", "dev"),
     ("/proc", "proc"),
     ("/sys", "sys"),
     // Bind host utilities until RunixOS has its own coreutils/shell
@@ -19,6 +18,14 @@ const BIND_MOUNTS: &[(&str, &str)] = &[
 /// Set up the sandbox filesystem by bind-mounting kernel interfaces
 pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
     // Ensure mount points exist
+    let dev_dir = sysroot.join("dev");
+    std::fs::create_dir_all(&dev_dir)
+        .map_err(|e| format!("mkdir dev: {}", e))?;
+    std::fs::create_dir_all(dev_dir.join("pts"))
+        .map_err(|e| format!("mkdir dev/pts: {}", e))?;
+    std::fs::create_dir_all(dev_dir.join("shm"))
+        .map_err(|e| format!("mkdir dev/shm: {}", e))?;
+
     for (_, target) in BIND_MOUNTS {
         let full = sysroot.join(target);
         std::fs::create_dir_all(&full)
@@ -30,7 +37,26 @@ pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&ephemeral)
         .map_err(|e| format!("mkdir Transit/Ephemeral: {}", e))?;
 
-    // Bind mount kernel interfaces
+    // Bind mount /dev non-recursively (avoids capturing /dev/pts from host)
+    mount(
+        Some("/dev"),
+        &dev_dir,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    ).map_err(|e| format!("bind mount /dev: {}", e))?;
+
+    // Mount a fresh devpts inside the sandbox's /dev/pts
+    // This gives us working PTYs without touching the host's /dev/pts
+    mount(
+        Some("devpts"),
+        &dev_dir.join("pts"),
+        Some("devpts"),
+        MsFlags::empty(),
+        Some("newinstance,ptmxmode=0666"),
+    ).map_err(|e| format!("mount devpts: {}", e))?;
+
+    // Bind mount other kernel interfaces
     for (source, target) in BIND_MOUNTS {
         let full = sysroot.join(target);
         mount(
@@ -54,58 +80,94 @@ pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Clean up mounts (called on normal exit; on crash, PID namespace handles it)
-pub fn cleanup_mounts(sysroot: &Path) {
-    let ephemeral = sysroot.join("Transit/Ephemeral");
-    let _ = umount2(&ephemeral, MntFlags::MNT_DETACH);
-
-    for (_, target) in BIND_MOUNTS.iter().rev() {
-        let full = sysroot.join(target);
-        let _ = umount2(&full, MntFlags::MNT_DETACH);
-    }
-}
+// No manual cleanup needed - mounts are in a private namespace that the
+// kernel destroys when the child process exits. This is crash-safe:
+// even if the sandbox process is killed, no host mounts are affected.
 
 /// Enter the sandbox with chroot (root mode)
 fn enter_chroot(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
-    // Create new mount + PID namespace
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
-        .map_err(|e| format!("unshare: {}", e))?;
-
-    setup_mounts(sysroot)?;
-
-    // Fork - child becomes PID 1 in new namespace
+    // SAFETY: We fork FIRST, then only the child enters new namespaces.
+    // This prevents the parent process (and host) from being affected
+    // if the child crashes or is killed before cleanup.
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Parent { child, .. }) => {
-            // Wait for child
+            // Parent just waits - child handles its own namespaces
             let status = nix::sys::wait::waitpid(child, None)
                 .map_err(|e| format!("waitpid: {}", e))?;
-            cleanup_mounts(sysroot);
             match status {
                 nix::sys::wait::WaitStatus::Exited(_, code) => Ok(code),
                 _ => Ok(1),
             }
         }
         Ok(nix::unistd::ForkResult::Child) => {
-            chroot(sysroot).map_err(|e| format!("chroot: {}", e))?;
-            chdir("/").map_err(|e| format!("chdir /: {}", e))?;
-            let _ = sethostname("runixos");
+            // Child: create new mount + PID namespace
+            // When this child exits, the kernel automatically cleans up
+            // all mounts in the namespace - no manual cleanup needed.
+            unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
+                .map_err(|e| {
+                    eprintln!("unshare failed: {}", e);
+                    std::process::exit(1);
+                }).unwrap();
 
-            let mut command = Command::new(cmd[0]);
-            if cmd.len() > 1 {
-                command.args(&cmd[1..]);
-            }
-            command.env_clear();
-            command.env("PATH", "/Core/Bin:/Construct/Bin:/host/bin");
-            command.env("HOME", "/Space/builder");
-            command.env("TERM", std::env::var("TERM").unwrap_or("xterm".into()));
-            command.env("LD_LIBRARY_PATH", "/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib");
-            for (k, v) in envs {
-                command.env(k, v);
+            // Make all existing mounts private so our bind mounts
+            // don't propagate back to the host
+            mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None::<&str>,
+            ).map_err(|e| {
+                eprintln!("make-private /: {}", e);
+                std::process::exit(1);
+            }).unwrap();
+
+            if let Err(e) = setup_mounts(sysroot) {
+                eprintln!("setup_mounts: {}", e);
+                std::process::exit(1);
             }
 
-            let status = command.status()
-                .map_err(|e| format!("exec {:?}: {}", cmd[0], e))?;
-            std::process::exit(status.code().unwrap_or(1));
+            // Fork again - grandchild becomes PID 1 in new PID namespace
+            match unsafe { nix::unistd::fork() } {
+                Ok(nix::unistd::ForkResult::Parent { child: grandchild, .. }) => {
+                    let status = nix::sys::wait::waitpid(grandchild, None)
+                        .unwrap_or(nix::sys::wait::WaitStatus::Exited(
+                            nix::unistd::Pid::from_raw(0), 1));
+                    // Mounts are cleaned up automatically when we exit
+                    // (namespace is destroyed with last process)
+                    let code = match status {
+                        nix::sys::wait::WaitStatus::Exited(_, code) => code,
+                        _ => 1,
+                    };
+                    std::process::exit(code);
+                }
+                Ok(nix::unistd::ForkResult::Child) => {
+                    chroot(sysroot).map_err(|e| format!("chroot: {}", e))?;
+                    chdir("/").map_err(|e| format!("chdir /: {}", e))?;
+                    let _ = sethostname("runixos");
+
+                    let mut command = Command::new(cmd[0]);
+                    if cmd.len() > 1 {
+                        command.args(&cmd[1..]);
+                    }
+                    command.env_clear();
+                    command.env("PATH", "/Core/Bin:/Construct/Bin:/host/bin");
+                    command.env("HOME", "/Space/builder");
+                    command.env("TERM", std::env::var("TERM").unwrap_or("xterm".into()));
+                    command.env("LD_LIBRARY_PATH", "/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib");
+                    for (k, v) in envs {
+                        command.env(k, v);
+                    }
+
+                    let status = command.status()
+                        .map_err(|e| format!("exec {:?}: {}", cmd[0], e))?;
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Err(e) => {
+                    eprintln!("fork (grandchild): {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Err(e) => Err(format!("fork: {}", e)),
     }
