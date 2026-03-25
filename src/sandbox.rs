@@ -1,13 +1,13 @@
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
-use nix::unistd::{chroot, chdir, sethostname};
+use nix::unistd::{chroot, chdir, sethostname, execve};
+use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 /// Mount points to bind into the sandbox (non-recursive to avoid capturing submounts)
 const BIND_MOUNTS: &[(&str, &str)] = &[
-    ("/proc", "proc"),
     ("/sys", "sys"),
     // Bind host utilities until RunixOS has its own coreutils/shell
     ("/usr/bin", "host/bin"),
@@ -21,10 +21,6 @@ pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
     let dev_dir = sysroot.join("dev");
     std::fs::create_dir_all(&dev_dir)
         .map_err(|e| format!("mkdir dev: {}", e))?;
-    std::fs::create_dir_all(dev_dir.join("pts"))
-        .map_err(|e| format!("mkdir dev/pts: {}", e))?;
-    std::fs::create_dir_all(dev_dir.join("shm"))
-        .map_err(|e| format!("mkdir dev/shm: {}", e))?;
 
     for (_, target) in BIND_MOUNTS {
         let full = sysroot.join(target);
@@ -37,24 +33,71 @@ pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&ephemeral)
         .map_err(|e| format!("mkdir Transit/Ephemeral: {}", e))?;
 
-    // Bind mount /dev non-recursively (avoids capturing /dev/pts from host)
+    // Mount tmpfs for /dev - completely isolated from host /dev
     mount(
-        Some("/dev"),
+        Some("tmpfs"),
         &dev_dir,
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    ).map_err(|e| format!("bind mount /dev: {}", e))?;
+        Some("tmpfs"),
+        MsFlags::empty(),
+        Some("size=65536k,mode=755"),
+    ).map_err(|e| format!("tmpfs /dev: {}", e))?;
 
-    // Mount a fresh devpts inside the sandbox's /dev/pts
-    // This gives us working PTYs without touching the host's /dev/pts
+    // Create essential device nodes
+    use nix::sys::stat::{mknod, Mode, SFlag};
+    let devices: &[(&str, u64)] = &[
+        ("null",    nix::sys::stat::makedev(1, 3)),
+        ("zero",    nix::sys::stat::makedev(1, 5)),
+        ("full",    nix::sys::stat::makedev(1, 7)),
+        ("random",  nix::sys::stat::makedev(1, 8)),
+        ("urandom", nix::sys::stat::makedev(1, 9)),
+        ("tty",     nix::sys::stat::makedev(5, 0)),
+    ];
+    for (name, dev) in devices {
+        let path = dev_dir.join(name);
+        let _ = mknod(&path, SFlag::S_IFCHR, Mode::from_bits_truncate(0o666), *dev);
+    }
+
+    // Symlinks
+    std::os::unix::fs::symlink("/proc/self/fd", dev_dir.join("fd")).ok();
+    std::os::unix::fs::symlink("/proc/self/fd/0", dev_dir.join("stdin")).ok();
+    std::os::unix::fs::symlink("/proc/self/fd/1", dev_dir.join("stdout")).ok();
+    std::os::unix::fs::symlink("/proc/self/fd/2", dev_dir.join("stderr")).ok();
+
+    // Mount devpts
+    std::fs::create_dir_all(dev_dir.join("pts"))
+        .map_err(|e| format!("mkdir dev/pts: {}", e))?;
     mount(
         Some("devpts"),
         &dev_dir.join("pts"),
         Some("devpts"),
         MsFlags::empty(),
-        Some("newinstance,ptmxmode=0666"),
+        Some("newinstance,ptmxmode=0666,mode=620,gid=5"),
     ).map_err(|e| format!("mount devpts: {}", e))?;
+    std::os::unix::fs::symlink("pts/ptmx", dev_dir.join("ptmx"))
+        .map_err(|e| format!("symlink dev/ptmx: {}", e))?;
+
+    // Mount devshm
+    std::fs::create_dir_all(dev_dir.join("shm"))
+        .map_err(|e| format!("mkdir dev/shm: {}", e))?;
+    mount(
+        Some("tmpfs"),
+        &dev_dir.join("shm"),
+        Some("tmpfs"),
+        MsFlags::empty(),
+        Some("size=64m"),
+    ).map_err(|e| format!("mount dev/shm: {}", e))?;
+
+    // Mount /proc (bind from host - we're not in a PID namespace)
+    let proc_dir = sysroot.join("proc");
+    std::fs::create_dir_all(&proc_dir)
+        .map_err(|e| format!("mkdir proc: {}", e))?;
+    mount(
+        Some("/proc"),
+        &proc_dir,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    ).map_err(|e| format!("bind mount /proc: {}", e))?;
 
     // Bind mount other kernel interfaces
     for (source, target) in BIND_MOUNTS {
@@ -85,7 +128,9 @@ pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
 // even if the sandbox process is killed, no host mounts are affected.
 
 /// Enter the sandbox with chroot (root mode)
-fn enter_chroot(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
+fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
+    let sysroot = sysroot_raw.canonicalize()
+        .map_err(|e| format!("canonicalize sysroot {:?}: {}", sysroot_raw, e))?;
     // SAFETY: We fork FIRST, then only the child enters new namespaces.
     // This prevents the parent process (and host) from being affected
     // if the child crashes or is killed before cleanup.
@@ -100,10 +145,10 @@ fn enter_chroot(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
             }
         }
         Ok(nix::unistd::ForkResult::Child) => {
-            // Child: create new mount + PID namespace
-            // When this child exits, the kernel automatically cleans up
-            // all mounts in the namespace - no manual cleanup needed.
-            unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
+            // Create new mount namespace only - skip CLONE_NEWPID to avoid
+            // the double-fork complexity and PID 1 reaping issues
+            // Enter isolated mount + UTS namespace
+            unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
                 .map_err(|e| {
                     eprintln!("unshare failed: {}", e);
                     std::process::exit(1);
@@ -122,52 +167,50 @@ fn enter_chroot(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
                 std::process::exit(1);
             }).unwrap();
 
-            if let Err(e) = setup_mounts(sysroot) {
+            if let Err(e) = setup_mounts(&sysroot) {
                 eprintln!("setup_mounts: {}", e);
                 std::process::exit(1);
             }
 
-            // Fork again - grandchild becomes PID 1 in new PID namespace
-            match unsafe { nix::unistd::fork() } {
-                Ok(nix::unistd::ForkResult::Parent { child: grandchild, .. }) => {
-                    let status = nix::sys::wait::waitpid(grandchild, None)
-                        .unwrap_or(nix::sys::wait::WaitStatus::Exited(
-                            nix::unistd::Pid::from_raw(0), 1));
-                    // Mounts are cleaned up automatically when we exit
-                    // (namespace is destroyed with last process)
-                    let code = match status {
-                        nix::sys::wait::WaitStatus::Exited(_, code) => code,
-                        _ => 1,
-                    };
-                    std::process::exit(code);
-                }
-                Ok(nix::unistd::ForkResult::Child) => {
-                    chroot(sysroot).map_err(|e| format!("chroot: {}", e))?;
-                    chdir("/").map_err(|e| format!("chdir /: {}", e))?;
-                    let _ = sethostname("runixos");
+            chroot(&sysroot).map_err(|e| {
+                eprintln!("chroot: {}", e);
+                std::process::exit(1);
+            }).unwrap();
+            chdir("/").map_err(|e| {
+                eprintln!("chdir /: {}", e);
+                std::process::exit(1);
+            }).unwrap();
+            let _ = sethostname("runixos");
 
-                    let mut command = Command::new(cmd[0]);
-                    if cmd.len() > 1 {
-                        command.args(&cmd[1..]);
-                    }
-                    command.env_clear();
-                    command.env("PATH", "/Core/Bin:/Construct/Bin:/host/bin");
-                    command.env("HOME", "/Space/builder");
-                    command.env("TERM", std::env::var("TERM").unwrap_or("xterm".into()));
-                    command.env("LD_LIBRARY_PATH", "/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib");
-                    for (k, v) in envs {
-                        command.env(k, v);
-                    }
 
-                    let status = command.status()
-                        .map_err(|e| format!("exec {:?}: {}", cmd[0], e))?;
-                    std::process::exit(status.code().unwrap_or(1));
-                }
-                Err(e) => {
-                    eprintln!("fork (grandchild): {}", e);
-                    std::process::exit(1);
-                }
+            // Build argv for execve
+            let argv: Vec<CString> = cmd.iter()
+                .map(|s| CString::new(*s).unwrap())
+                .collect();
+
+            // Build envp for execve
+            let term = std::env::var("TERM").unwrap_or("xterm".into());
+            let mut env_strings = vec![
+                format!("PATH=/Core/Bin:/Construct/Bin:/host/bin"),
+                format!("HOME=/Space/builder"),
+                format!("TERM={}", term),
+                format!("LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib"),
+                format!("PS1=runixos# "),
+            ];
+            for (k, v) in envs {
+                env_strings.push(format!("{}={}", k, v));
             }
+            let envp: Vec<CString> = env_strings.iter()
+                .map(|s| CString::new(s.as_str()).unwrap())
+                .collect();
+
+            // execve replaces this process with the shell
+            execve(&argv[0], &argv, &envp)
+                .map_err(|e| {
+                    eprintln!("execve {:?}: {}", cmd[0], e);
+                    std::process::exit(1);
+                }).unwrap();
+            unreachable!();
         }
         Err(e) => Err(format!("fork: {}", e)),
     }
@@ -178,6 +221,9 @@ fn enter_chroot(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
 /// environment variables so tools find RunixOS sysroot paths, and use
 /// PID namespace for process isolation.
 fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
+    // Canonicalize to absolute path so wrapper scripts work regardless of cwd
+    let sysroot = sysroot.canonicalize()
+        .map_err(|e| format!("canonicalize sysroot {:?}: {}", sysroot, e))?;
     let sysroot_str = sysroot.to_str().unwrap();
 
     // RunixOS binaries have interpreter /Core/LibKit/ld-runixos-x86-64.rdl.2
@@ -249,6 +295,7 @@ fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
     command.env("TERM", std::env::var("TERM").unwrap_or("xterm".into()));
     command.env("LD_LIBRARY_PATH", format!("{}/Core/LibKit:{}/Construct/LibKit", sysroot_str, sysroot_str));
     command.env("SYSROOT", sysroot_str);
+    command.env("PS1", "runixos$ ");
     command.env("CC", format!("{}/Core/Bin/clang", sysroot_str));
     command.env("CXX", format!("{}/Core/Bin/clang++", sysroot_str));
     command.env("CMAKE", format!("{}/Core/Bin/cmake", sysroot_str));
@@ -324,15 +371,17 @@ pub fn enter_interactive(sysroot: &Path, is_root: bool) -> Result<(), String> {
     }
 
     // Prefer RunixOS shell, fall back to host shell
-    let shell = if sysroot.join("Core/Bin/brush").exists() {
-        "/Core/Bin/brush"
-    } else if sysroot.join("Core/Bin/nu").exists() {
-        "/Core/Bin/nu"
+    let (shell, shell_args): (&str, &[&str]) = if sysroot.join("Core/Bin/nu").exists() {
+        ("/Core/Bin/nu", &[])
+    } else if sysroot.join("Core/Bin/brush").exists() {
+        ("/Core/Bin/brush", &["-i"])
     } else {
-        "/host/bin/sh"
+        ("/host/bin/sh", &["-i"])
     };
 
-    let code = run_in_sandbox(sysroot, &[shell], &[], is_root)?;
+    let mut cmd = vec![shell];
+    cmd.extend_from_slice(shell_args);
+    let code = run_in_sandbox(sysroot, &cmd, &[], is_root)?;
     if code != 0 {
         Err(format!("Shell exited with code {}", code))
     } else {
