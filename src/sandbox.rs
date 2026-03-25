@@ -1,6 +1,7 @@
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{chroot, chdir, sethostname};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -117,43 +118,71 @@ fn enter_chroot(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
 fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
     let sysroot_str = sysroot.to_str().unwrap();
 
-    // Resolve command - map RunixOS absolute paths to sysroot-prefixed paths
+    // RunixOS binaries have interpreter /Core/LibKit/ld-runixos-x86-64.rdl.2
+    // which doesn't exist on the host. Create wrapper scripts that invoke each
+    // binary via the dynamic linker so they work without chroot.
+    let ld_path = format!("{}/Core/LibKit/ld-runixos-x86-64.rdl.2", sysroot_str);
+    let lib_path = format!("{}/Core/LibKit", sysroot_str);
+    let bin_dir = sysroot.join("Core/Bin");
+    let has_ld = std::path::Path::new(&ld_path).exists();
+
+    let wrapper_dir = std::env::temp_dir().join("runixos-wrappers");
+    if has_ld && bin_dir.exists() {
+        let _ = std::fs::remove_dir_all(&wrapper_dir);
+        std::fs::create_dir_all(&wrapper_dir)
+            .map_err(|e| format!("mkdir wrappers: {}", e))?;
+
+        // Create a wrapper for each binary/symlink in Core/Bin
+        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let target_bin = entry.path();
+                let wrapper = wrapper_dir.join(&*name);
+                let script = format!(
+                    "#!/bin/sh\nexec \"{}\" --library-path \"{}\" \"{}\" \"$@\"\n",
+                    ld_path, lib_path, target_bin.display()
+                );
+                let _ = std::fs::write(&wrapper, script);
+                let _ = std::fs::set_permissions(
+                    &wrapper,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                );
+                // Skip if it's a host tool (like clang) that runs natively
+                if name_str == "clang" || name_str == "clang++" || name_str.starts_with("llvm-")
+                    || name_str == "cmake" || name_str == "lld" || name_str == "ninja"
+                {
+                    let _ = std::fs::remove_file(&wrapper);
+                }
+            }
+        }
+    }
+
+    // Resolve command
     let real_cmd = if cmd[0] == "/host/bin/sh" {
         "/bin/sh".to_string()
     } else if cmd[0].starts_with("/Core/") || cmd[0].starts_with("/Construct/") {
-        format!("{}{}", sysroot_str, cmd[0])
+        // Use wrapper if available
+        let name = std::path::Path::new(cmd[0]).file_name().unwrap().to_string_lossy().to_string();
+        let wrapper = wrapper_dir.join(&name);
+        if wrapper.exists() {
+            wrapper.to_string_lossy().to_string()
+        } else {
+            format!("{}{}", sysroot_str, cmd[0])
+        }
     } else {
         cmd[0].to_string()
     };
 
-    // RunixOS binaries need the custom dynamic linker to execute on the host.
-    // Use the linker as an interpreter: ld-runixos ... <binary> [args]
-    let ld_path = format!("{}/Core/LibKit/ld-runixos-x86-64.rdl.2", sysroot_str);
-    let lib_path = format!("{}/Core/LibKit", sysroot_str);
-    let use_ld = std::path::Path::new(&ld_path).exists()
-        && std::path::Path::new(&real_cmd).exists()
-        && real_cmd.contains("/Core/");
-
-    let mut command = if use_ld {
-        let mut c = Command::new(&ld_path);
-        c.arg("--library-path").arg(&lib_path);
-        c.arg(&real_cmd);
-        if cmd.len() > 1 {
-            c.args(&cmd[1..]);
-        }
-        c
-    } else {
-        let mut c = Command::new(&real_cmd);
-        if cmd.len() > 1 {
-            c.args(&cmd[1..]);
-        }
-        c
-    };
+    let mut command = Command::new(&real_cmd);
+    if cmd.len() > 1 {
+        command.args(&cmd[1..]);
+    }
     command.env_clear();
-    // RunixOS tools first, host tools as fallback
+    // Wrappers first, then host tools as fallback
     let cargo_bin = std::env::var("HOME").map(|h| format!("{}/.cargo/bin", h)).unwrap_or_default();
-    command.env("PATH", format!("{}/Core/Bin:{}/Construct/Bin:{}:/usr/bin:/bin",
-        sysroot_str, sysroot_str, cargo_bin));
+    command.env("PATH", format!("{}:{}/Core/Bin:{}/Construct/Bin:{}:/usr/bin:/bin",
+        wrapper_dir.display(), sysroot_str, sysroot_str, cargo_bin));
     command.env("HOME", std::env::var("HOME").unwrap_or("/tmp".into()));
     command.env("TERM", std::env::var("TERM").unwrap_or("xterm".into()));
     command.env("LD_LIBRARY_PATH", format!("{}/Core/LibKit:{}/Construct/LibKit", sysroot_str, sysroot_str));
