@@ -117,13 +117,38 @@ fn enter_chroot(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
 fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
     let sysroot_str = sysroot.to_str().unwrap();
 
-    // Resolve command - use host shell but point to sysroot tools
-    let real_cmd = if cmd[0] == "/host/bin/sh" { "/bin/sh" } else { cmd[0] };
+    // Resolve command - map RunixOS absolute paths to sysroot-prefixed paths
+    let real_cmd = if cmd[0] == "/host/bin/sh" {
+        "/bin/sh".to_string()
+    } else if cmd[0].starts_with("/Core/") || cmd[0].starts_with("/Construct/") {
+        format!("{}{}", sysroot_str, cmd[0])
+    } else {
+        cmd[0].to_string()
+    };
 
-    let mut command = Command::new(real_cmd);
-    if cmd.len() > 1 {
-        command.args(&cmd[1..]);
-    }
+    // RunixOS binaries need the custom dynamic linker to execute on the host.
+    // Use the linker as an interpreter: ld-runixos ... <binary> [args]
+    let ld_path = format!("{}/Core/LibKit/ld-runixos-x86-64.rdl.2", sysroot_str);
+    let lib_path = format!("{}/Core/LibKit", sysroot_str);
+    let use_ld = std::path::Path::new(&ld_path).exists()
+        && std::path::Path::new(&real_cmd).exists()
+        && real_cmd.contains("/Core/");
+
+    let mut command = if use_ld {
+        let mut c = Command::new(&ld_path);
+        c.arg("--library-path").arg(&lib_path);
+        c.arg(&real_cmd);
+        if cmd.len() > 1 {
+            c.args(&cmd[1..]);
+        }
+        c
+    } else {
+        let mut c = Command::new(&real_cmd);
+        if cmd.len() > 1 {
+            c.args(&cmd[1..]);
+        }
+        c
+    };
     command.env_clear();
     // RunixOS tools first, host tools as fallback
     let cargo_bin = std::env::var("HOME").map(|h| format!("{}/.cargo/bin", h)).unwrap_or_default();
@@ -207,7 +232,16 @@ pub fn enter_interactive(sysroot: &Path, is_root: bool) -> Result<(), String> {
         }
     }
 
-    let code = run_in_sandbox(sysroot, &["/host/bin/sh"], &[], is_root)?;
+    // Prefer RunixOS shell, fall back to host shell
+    let shell = if sysroot.join("Core/Bin/brush").exists() {
+        "/Core/Bin/brush"
+    } else if sysroot.join("Core/Bin/nu").exists() {
+        "/Core/Bin/nu"
+    } else {
+        "/host/bin/sh"
+    };
+
+    let code = run_in_sandbox(sysroot, &[shell], &[], is_root)?;
     if code != 0 {
         Err(format!("Shell exited with code {}", code))
     } else {
