@@ -136,12 +136,36 @@ fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
     command.env("CC", format!("{}/Core/Bin/clang", sysroot_str));
     command.env("CXX", format!("{}/Core/Bin/clang++", sysroot_str));
     command.env("CMAKE", format!("{}/Core/Bin/cmake", sysroot_str));
-    command.env("CFLAGS", format!("--sysroot={} --target=x86_64-rovelstars-runixos", sysroot_str));
-    command.env("CXXFLAGS", format!("--sysroot={} --target=x86_64-rovelstars-runixos", sysroot_str));
-    command.env("C_INCLUDE_PATH", format!("{}/Core/APIHeader", sysroot_str));
-    command.env("CPLUS_INCLUDE_PATH", format!("{}/Core/APIHeader:{}/Core/APIHeader/c++/v1", sysroot_str, sysroot_str));
-    command.env("LIBRARY_PATH", format!("{}/Core/LibKit", sysroot_str));
-    command.env("PKG_CONFIG_SYSROOT_DIR", sysroot_str);
+    command.env("AR", format!("{}/Core/Bin/llvm-ar", sysroot_str));
+
+    // RunixOS Rust cross-compilation
+    let rust_build = std::path::Path::new(sysroot_str)
+        .parent().unwrap_or(std::path::Path::new("/"))
+        .join("coding/rovelos/rust/build/x86_64-unknown-linux-gnu");
+    let stage1_rustc = rust_build.join("stage1/bin/rustc");
+    let stage1_std = rust_build.join("stage1-std/x86_64-rovelstars-runixos/release/deps");
+    if stage1_rustc.exists() {
+        command.env("RUNIXOS_RUSTC", stage1_rustc.to_str().unwrap());
+        command.env("RUNIXOS_STD_DEPS", stage1_std.to_str().unwrap());
+        command.env("CARGO_TARGET_X86_64_ROVELSTARS_RUNIXOS_LINKER",
+            format!("{}/Core/Bin/clang", sysroot_str));
+        command.env("RUNIXOS_TARGET", "x86_64-rovelstars-runixos");
+    }
+    // Path to our patched libc crate for RunixOS
+    let libc_path = std::path::Path::new(sysroot_str)
+        .parent().unwrap_or(std::path::Path::new("/"))
+        .join("coding/rovelos/libc");
+    if libc_path.exists() {
+        command.env("RUNIXOS_LIBC_PATH", libc_path.to_str().unwrap());
+    }
+
+    // Cross-compilation CC/CXX for RunixOS target (used by cc-rs)
+    command.env("CC_x86_64_rovelstars_runixos", format!("{}/Core/Bin/clang", sysroot_str));
+    command.env("CXX_x86_64_rovelstars_runixos", format!("{}/Core/Bin/clang++", sysroot_str));
+    command.env("AR_x86_64_rovelstars_runixos", format!("{}/Core/Bin/llvm-ar", sysroot_str));
+    command.env("CFLAGS_x86_64_rovelstars_runixos",
+        format!("--sysroot={} --target=x86_64-rovelstars-runixos", sysroot_str));
+
     // Inherit host's HOME for cargo/rustup
     if let Ok(home) = std::env::var("HOME") {
         command.env("CARGO_HOME", format!("{}/.cargo", home));

@@ -29,6 +29,10 @@ pub fn build_package(
         copy_dir_recursive(patches, &patches_dest)?;
     }
 
+    // For RunixOS cross-compilation, packages need our patched libc crate.
+    // We inject [patch.crates-io] into each project's Cargo.toml at build time.
+    // This is done in build.sh via the RUNIXOS_LIBC_PATH env var.
+
     // Paths: in root mode, use absolute /Transit/... (chroot'd)
     // In non-root mode, use sysroot-prefixed paths
     let (src_path, out_path, patches_path) = if is_root {
