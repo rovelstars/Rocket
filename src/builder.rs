@@ -93,6 +93,7 @@ pub fn build_package(
         &["/host/bin/sh", "-e", "-c", &build_cmd],
         &env_refs,
         is_root,
+        true, // builds always need host tools (cargo, rustc, etc.)
     )?;
 
     if code != 0 {

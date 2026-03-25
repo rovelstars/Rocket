@@ -6,27 +6,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-/// Mount points to bind into the sandbox (non-recursive to avoid capturing submounts)
-const BIND_MOUNTS: &[(&str, &str)] = &[
-    ("/sys", "sys"),
-    // Bind host utilities until RunixOS has its own coreutils/shell
+/// Host bind mounts - only used when host links are enabled
+const HOST_MOUNTS: &[(&str, &str)] = &[
     ("/usr/bin", "host/bin"),
     ("/usr/lib", "host/lib"),
     ("/lib", "host/syslib"),
 ];
 
-/// Set up the sandbox filesystem by bind-mounting kernel interfaces
-pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
-    // Ensure mount points exist
+/// Set up the sandbox filesystem
+pub fn setup_mounts(sysroot: &Path, enable_host_links: bool) -> Result<(), String> {
     let dev_dir = sysroot.join("dev");
     std::fs::create_dir_all(&dev_dir)
         .map_err(|e| format!("mkdir dev: {}", e))?;
-
-    for (_, target) in BIND_MOUNTS {
-        let full = sysroot.join(target);
-        std::fs::create_dir_all(&full)
-            .map_err(|e| format!("mkdir {:?}: {}", full, e))?;
-    }
 
     // Create Transit directories
     let ephemeral = sysroot.join("Transit/Ephemeral");
@@ -99,16 +90,37 @@ pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
         None::<&str>,
     ).map_err(|e| format!("bind mount /proc: {}", e))?;
 
-    // Bind mount other kernel interfaces
-    for (source, target) in BIND_MOUNTS {
-        let full = sysroot.join(target);
-        mount(
-            Some(*source),
-            &full,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        ).map_err(|e| format!("bind mount {} -> {:?}: {}", source, full, e))?;
+    // Mount /sys
+    let sys_dir = sysroot.join("sys");
+    std::fs::create_dir_all(&sys_dir)
+        .map_err(|e| format!("mkdir sys: {}", e))?;
+    mount(
+        Some("/sys"),
+        &sys_dir,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    ).map_err(|e| format!("bind mount /sys: {}", e))?;
+
+    // Host tool mounts - only when explicitly requested
+    if enable_host_links {
+        for (source, target) in HOST_MOUNTS {
+            let full = sysroot.join(target);
+            std::fs::create_dir_all(&full)
+                .map_err(|e| format!("mkdir {:?}: {}", full, e))?;
+            mount(
+                Some(*source),
+                &full,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            ).map_err(|e| format!("bind mount {} -> {:?}: {}", source, full, e))?;
+        }
+
+        // Symlink so host ELF binaries can find their interpreter
+        let lib64 = sysroot.join("lib64");
+        std::fs::create_dir_all(&lib64).ok();
+        std::os::unix::fs::symlink("/host/syslib/ld-linux-x86-64.so.2", lib64.join("ld-linux-x86-64.so.2")).ok();
     }
 
     // Mount tmpfs for /Transit/Ephemeral
@@ -128,7 +140,7 @@ pub fn setup_mounts(sysroot: &Path) -> Result<(), String> {
 // even if the sandbox process is killed, no host mounts are affected.
 
 /// Enter the sandbox with chroot (root mode)
-fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
+fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)], enable_host_links: bool) -> Result<i32, String> {
     let sysroot = sysroot_raw.canonicalize()
         .map_err(|e| format!("canonicalize sysroot {:?}: {}", sysroot_raw, e))?;
     // SAFETY: We fork FIRST, then only the child enters new namespaces.
@@ -145,8 +157,6 @@ fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Resu
             }
         }
         Ok(nix::unistd::ForkResult::Child) => {
-            // Create new mount namespace only - skip CLONE_NEWPID to avoid
-            // the double-fork complexity and PID 1 reaping issues
             // Enter isolated mount + UTS namespace
             unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
                 .map_err(|e| {
@@ -167,7 +177,7 @@ fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Resu
                 std::process::exit(1);
             }).unwrap();
 
-            if let Err(e) = setup_mounts(&sysroot) {
+            if let Err(e) = setup_mounts(&sysroot, enable_host_links) {
                 eprintln!("setup_mounts: {}", e);
                 std::process::exit(1);
             }
@@ -182,7 +192,6 @@ fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Resu
             }).unwrap();
             let _ = sethostname("runixos");
 
-
             // Build argv for execve
             let argv: Vec<CString> = cmd.iter()
                 .map(|s| CString::new(*s).unwrap())
@@ -191,12 +200,18 @@ fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Resu
             // Build envp for execve
             let term = std::env::var("TERM").unwrap_or("xterm".into());
             let mut env_strings = vec![
-                format!("PATH=/Core/Bin:/Construct/Bin:/host/bin"),
                 format!("HOME=/Space/builder"),
                 format!("TERM={}", term),
-                format!("LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib"),
-                format!("PS1=runixos# "),
             ];
+
+            if enable_host_links {
+                env_strings.push(format!("PATH=/Core/Bin:/Construct/Bin:/host/bin"));
+                env_strings.push(format!("LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib"));
+            } else {
+                env_strings.push(format!("PATH=/Core/Bin:/Construct/Bin"));
+                env_strings.push(format!("LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit"));
+            }
+
             for (k, v) in envs {
                 env_strings.push(format!("{}={}", k, v));
             }
@@ -218,9 +233,8 @@ fn enter_chroot(sysroot_raw: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Resu
 
 /// Enter the sandbox with user namespaces (non-root mode)
 /// Without root, we can't chroot or bind mount. Instead, we set up
-/// environment variables so tools find RunixOS sysroot paths, and use
-/// PID namespace for process isolation.
-fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i32, String> {
+/// environment variables so tools find RunixOS sysroot paths.
+fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)], enable_host_links: bool) -> Result<i32, String> {
     // Canonicalize to absolute path so wrapper scripts work regardless of cwd
     let sysroot = sysroot.canonicalize()
         .map_err(|e| format!("canonicalize sysroot {:?}: {}", sysroot, e))?;
@@ -287,53 +301,60 @@ fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
         command.args(&cmd[1..]);
     }
     command.env_clear();
-    // Wrappers first, then host tools as fallback
-    let cargo_bin = std::env::var("HOME").map(|h| format!("{}/.cargo/bin", h)).unwrap_or_default();
-    command.env("PATH", format!("{}:{}/Core/Bin:{}/Construct/Bin:{}:/usr/bin:/bin",
-        wrapper_dir.display(), sysroot_str, sysroot_str, cargo_bin));
+
+    if enable_host_links {
+        let cargo_bin = std::env::var("HOME").map(|h| format!("{}/.cargo/bin", h)).unwrap_or_default();
+        command.env("PATH", format!("{}:{}/Core/Bin:{}/Construct/Bin:{}:/usr/bin:/bin",
+            wrapper_dir.display(), sysroot_str, sysroot_str, cargo_bin));
+        command.env("LD_LIBRARY_PATH", format!("{}/Core/LibKit:{}/Construct/LibKit", sysroot_str, sysroot_str));
+
+        // Cross-compilation env vars for builds
+        command.env("CC", format!("{}/Core/Bin/clang", sysroot_str));
+        command.env("CXX", format!("{}/Core/Bin/clang++", sysroot_str));
+        command.env("CMAKE", format!("{}/Core/Bin/cmake", sysroot_str));
+        command.env("AR", format!("{}/Core/Bin/llvm-ar", sysroot_str));
+
+        // RunixOS Rust cross-compilation
+        let rust_build = std::path::Path::new(sysroot_str)
+            .parent().unwrap_or(std::path::Path::new("/"))
+            .join("coding/rovelos/rust/build/x86_64-unknown-linux-gnu");
+        let stage1_rustc = rust_build.join("stage1/bin/rustc");
+        let stage1_std = rust_build.join("stage1-std/x86_64-rovelstars-runixos/release/deps");
+        if stage1_rustc.exists() {
+            command.env("RUNIXOS_RUSTC", stage1_rustc.to_str().unwrap());
+            command.env("RUNIXOS_STD_DEPS", stage1_std.to_str().unwrap());
+            command.env("CARGO_TARGET_X86_64_ROVELSTARS_RUNIXOS_LINKER",
+                format!("{}/Core/Bin/clang", sysroot_str));
+            command.env("RUNIXOS_TARGET", "x86_64-rovelstars-runixos");
+        }
+        let libc_path = std::path::Path::new(sysroot_str)
+            .parent().unwrap_or(std::path::Path::new("/"))
+            .join("coding/rovelos/libc");
+        if libc_path.exists() {
+            command.env("RUNIXOS_LIBC_PATH", libc_path.to_str().unwrap());
+        }
+
+        command.env("CC_x86_64_rovelstars_runixos", format!("{}/Core/Bin/clang", sysroot_str));
+        command.env("CXX_x86_64_rovelstars_runixos", format!("{}/Core/Bin/clang++", sysroot_str));
+        command.env("AR_x86_64_rovelstars_runixos", format!("{}/Core/Bin/llvm-ar", sysroot_str));
+        command.env("CFLAGS_x86_64_rovelstars_runixos",
+            format!("--sysroot={} --target=x86_64-rovelstars-runixos", sysroot_str));
+
+        // Inherit host's HOME for cargo/rustup
+        if let Ok(home) = std::env::var("HOME") {
+            command.env("CARGO_HOME", format!("{}/.cargo", home));
+            command.env("RUSTUP_HOME", format!("{}/.rustup", home));
+        }
+    } else {
+        command.env("PATH", format!("{}:{}/Core/Bin:{}/Construct/Bin",
+            wrapper_dir.display(), sysroot_str, sysroot_str));
+        command.env("LD_LIBRARY_PATH", format!("{}/Core/LibKit:{}/Construct/LibKit", sysroot_str, sysroot_str));
+    }
+
     command.env("HOME", std::env::var("HOME").unwrap_or("/tmp".into()));
     command.env("TERM", std::env::var("TERM").unwrap_or("xterm".into()));
-    command.env("LD_LIBRARY_PATH", format!("{}/Core/LibKit:{}/Construct/LibKit", sysroot_str, sysroot_str));
     command.env("SYSROOT", sysroot_str);
-    command.env("PS1", "runixos$ ");
-    command.env("CC", format!("{}/Core/Bin/clang", sysroot_str));
-    command.env("CXX", format!("{}/Core/Bin/clang++", sysroot_str));
-    command.env("CMAKE", format!("{}/Core/Bin/cmake", sysroot_str));
-    command.env("AR", format!("{}/Core/Bin/llvm-ar", sysroot_str));
 
-    // RunixOS Rust cross-compilation
-    let rust_build = std::path::Path::new(sysroot_str)
-        .parent().unwrap_or(std::path::Path::new("/"))
-        .join("coding/rovelos/rust/build/x86_64-unknown-linux-gnu");
-    let stage1_rustc = rust_build.join("stage1/bin/rustc");
-    let stage1_std = rust_build.join("stage1-std/x86_64-rovelstars-runixos/release/deps");
-    if stage1_rustc.exists() {
-        command.env("RUNIXOS_RUSTC", stage1_rustc.to_str().unwrap());
-        command.env("RUNIXOS_STD_DEPS", stage1_std.to_str().unwrap());
-        command.env("CARGO_TARGET_X86_64_ROVELSTARS_RUNIXOS_LINKER",
-            format!("{}/Core/Bin/clang", sysroot_str));
-        command.env("RUNIXOS_TARGET", "x86_64-rovelstars-runixos");
-    }
-    // Path to our patched libc crate for RunixOS
-    let libc_path = std::path::Path::new(sysroot_str)
-        .parent().unwrap_or(std::path::Path::new("/"))
-        .join("coding/rovelos/libc");
-    if libc_path.exists() {
-        command.env("RUNIXOS_LIBC_PATH", libc_path.to_str().unwrap());
-    }
-
-    // Cross-compilation CC/CXX for RunixOS target (used by cc-rs)
-    command.env("CC_x86_64_rovelstars_runixos", format!("{}/Core/Bin/clang", sysroot_str));
-    command.env("CXX_x86_64_rovelstars_runixos", format!("{}/Core/Bin/clang++", sysroot_str));
-    command.env("AR_x86_64_rovelstars_runixos", format!("{}/Core/Bin/llvm-ar", sysroot_str));
-    command.env("CFLAGS_x86_64_rovelstars_runixos",
-        format!("--sysroot={} --target=x86_64-rovelstars-runixos", sysroot_str));
-
-    // Inherit host's HOME for cargo/rustup
-    if let Ok(home) = std::env::var("HOME") {
-        command.env("CARGO_HOME", format!("{}/.cargo", home));
-        command.env("RUSTUP_HOME", format!("{}/.rustup", home));
-    }
     for (k, v) in envs {
         command.env(k, v);
     }
@@ -349,16 +370,17 @@ pub fn run_in_sandbox(
     cmd: &[&str],
     envs: &[(&str, &str)],
     is_root: bool,
+    enable_host_links: bool,
 ) -> Result<i32, String> {
     if is_root {
-        enter_chroot(sysroot, cmd, envs)
+        enter_chroot(sysroot, cmd, envs, enable_host_links)
     } else {
-        enter_userns(sysroot, cmd, envs)
+        enter_userns(sysroot, cmd, envs, enable_host_links)
     }
 }
 
 /// Enter interactive shell in sandbox
-pub fn enter_interactive(sysroot: &Path, is_root: bool) -> Result<(), String> {
+pub fn enter_interactive(sysroot: &Path, is_root: bool, enable_host_links: bool) -> Result<(), String> {
     // Show RunixOS banner
     if let Ok(release) = std::fs::read_to_string(sysroot.join("Core/Config/OSReleaseInfo")) {
         for line in release.lines() {
@@ -370,18 +392,20 @@ pub fn enter_interactive(sysroot: &Path, is_root: bool) -> Result<(), String> {
         }
     }
 
-    // Prefer RunixOS shell, fall back to host shell
-    let (shell, shell_args): (&str, &[&str]) = if sysroot.join("Core/Bin/nu").exists() {
+    // Prefer RunixOS shell, fall back to host shell (only if host links enabled)
+    let (shell, shell_args): (&str, &[&str]) = if sysroot.join("Core/Bin/brush").exists() {
+        ("/Core/Bin/brush", &["--login", "-i"])
+    } else if sysroot.join("Core/Bin/nu").exists() {
         ("/Core/Bin/nu", &[])
-    } else if sysroot.join("Core/Bin/brush").exists() {
-        ("/Core/Bin/brush", &["-i"])
-    } else {
+    } else if enable_host_links {
         ("/host/bin/sh", &["-i"])
+    } else {
+        return Err("No RunixOS shell found (brush or nu). Use --enable-host-links for host fallback.".into());
     };
 
     let mut cmd = vec![shell];
     cmd.extend_from_slice(shell_args);
-    let code = run_in_sandbox(sysroot, &cmd, &[], is_root)?;
+    let code = run_in_sandbox(sysroot, &cmd, &[], is_root, enable_host_links)?;
     if code != 0 {
         Err(format!("Shell exited with code {}", code))
     } else {

@@ -47,6 +47,9 @@ enum Command {
     Enter {
         #[arg(short, long, default_value = "/home/ren/ROS")]
         sysroot: PathBuf,
+        /// Mount host tools (/usr/bin, /usr/lib) into the sandbox
+        #[arg(long)]
+        enable_host_links: bool,
     },
 }
 
@@ -123,9 +126,10 @@ fn main() {
                 }
             }
         }
-        Command::Enter { sysroot } => {
-            println!("{} RunixOS sandbox at {:?}", "Entering".cyan().bold(), sysroot);
-            if let Err(e) = sandbox::enter_interactive(&sysroot, is_root) {
+        Command::Enter { sysroot, enable_host_links } => {
+            println!("{} RunixOS sandbox at {:?}{}", "Entering".cyan().bold(), sysroot,
+                if enable_host_links { " (host links enabled)" } else { "" });
+            if let Err(e) = sandbox::enter_interactive(&sysroot, is_root, enable_host_links) {
                 eprintln!("{} {}", "Error:".red().bold(), e);
                 std::process::exit(1);
             }
