@@ -59,6 +59,7 @@ pub fn build_package(
         ("PATCHES".into(), patches_path.clone()),
         ("SYSROOT".into(), sysroot.to_string_lossy().to_string()),
         ("JOBS".into(), num_cpus().to_string()),
+        ("ROCKET_OUTPUT".into(), output.parent().unwrap_or(output).to_string_lossy().to_string()),
     ];
 
     // Add extra fields from meta.toml as env vars
