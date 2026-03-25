@@ -29,14 +29,31 @@ pub fn build_package(
         copy_dir_recursive(patches, &patches_dest)?;
     }
 
+    // Paths: in root mode, use absolute /Transit/... (chroot'd)
+    // In non-root mode, use sysroot-prefixed paths
+    let (src_path, out_path, patches_path) = if is_root {
+        (
+            "/Transit/Ephemeral/build".to_string(),
+            "/Transit/Ephemeral/output".to_string(),
+            "/Transit/Ephemeral/build/patches".to_string(),
+        )
+    } else {
+        (
+            src_dir.to_string_lossy().to_string(),
+            sysroot.join("Transit/Ephemeral/output").to_string_lossy().to_string(),
+            src_dir.join("patches").to_string_lossy().to_string(),
+        )
+    };
+
     // Build environment variables from meta.toml
     let mut envs: Vec<(String, String)> = vec![
         ("NAME".into(), pkg.meta.name.clone()),
         ("VERSION".into(), pkg.meta.version.clone()),
         ("REPOSITORY".into(), pkg.meta.repository.clone()),
-        ("OUTPUT".into(), "/Transit/Ephemeral/output".into()),
-        ("SRC".into(), "/Transit/Ephemeral/build".into()),
-        ("PATCHES".into(), "/Transit/Ephemeral/build/patches".into()),
+        ("OUTPUT".into(), out_path.clone()),
+        ("SRC".into(), src_path.clone()),
+        ("PATCHES".into(), patches_path.clone()),
+        ("SYSROOT".into(), sysroot.to_string_lossy().to_string()),
         ("JOBS".into(), num_cpus().to_string()),
     ];
 
@@ -56,14 +73,14 @@ pub fn build_package(
         .collect();
 
     // Run build.sh inside sandbox
-    // The script should define configure(), build(), install() functions
     let build_cmd = format!(
-        "cd /Transit/Ephemeral/build && \
-         mkdir -p /Transit/Ephemeral/output && \
+        "cd {src} && \
+         mkdir -p {out} && \
          source ./build.sh && \
          if type configure >/dev/null 2>&1; then echo '>>> configure' && configure; fi && \
          if type build >/dev/null 2>&1; then echo '>>> build' && build; fi && \
-         if type install >/dev/null 2>&1; then echo '>>> install' && install; fi"
+         if type install >/dev/null 2>&1; then echo '>>> install' && install; fi",
+        src = src_path, out = out_path
     );
 
     let code = sandbox::run_in_sandbox(
@@ -102,8 +119,16 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         let entry = entry.map_err(|e| format!("entry: {}", e))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let file_type = entry.file_type().map_err(|e| format!("filetype: {}", e))?;
+        if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            // Preserve symlinks
+            let target = std::fs::read_link(&src_path)
+                .map_err(|e| format!("readlink {:?}: {}", src_path, e))?;
+            let _ = std::fs::remove_file(&dst_path);
+            std::os::unix::fs::symlink(&target, &dst_path)
+                .map_err(|e| format!("symlink {:?} -> {:?}: {}", dst_path, target, e))?;
         } else {
             std::fs::copy(&src_path, &dst_path)
                 .map_err(|e| format!("copy {:?}: {}", src_path, e))?;
