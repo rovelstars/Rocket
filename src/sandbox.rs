@@ -126,7 +126,9 @@ fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
     }
     command.env_clear();
     // RunixOS tools first, host tools as fallback
-    command.env("PATH", format!("{}/Core/Bin:{}/Construct/Bin:/usr/bin:/bin", sysroot_str, sysroot_str));
+    let cargo_bin = std::env::var("HOME").map(|h| format!("{}/.cargo/bin", h)).unwrap_or_default();
+    command.env("PATH", format!("{}/Core/Bin:{}/Construct/Bin:{}:/usr/bin:/bin",
+        sysroot_str, sysroot_str, cargo_bin));
     command.env("HOME", std::env::var("HOME").unwrap_or("/tmp".into()));
     command.env("TERM", std::env::var("TERM").unwrap_or("xterm".into()));
     command.env("LD_LIBRARY_PATH", format!("{}/Core/LibKit:{}/Construct/LibKit", sysroot_str, sysroot_str));
@@ -134,6 +136,17 @@ fn enter_userns(sysroot: &Path, cmd: &[&str], envs: &[(&str, &str)]) -> Result<i
     command.env("CC", format!("{}/Core/Bin/clang", sysroot_str));
     command.env("CXX", format!("{}/Core/Bin/clang++", sysroot_str));
     command.env("CMAKE", format!("{}/Core/Bin/cmake", sysroot_str));
+    command.env("CFLAGS", format!("--sysroot={} --target=x86_64-rovelstars-runixos", sysroot_str));
+    command.env("CXXFLAGS", format!("--sysroot={} --target=x86_64-rovelstars-runixos", sysroot_str));
+    command.env("C_INCLUDE_PATH", format!("{}/Core/APIHeader", sysroot_str));
+    command.env("CPLUS_INCLUDE_PATH", format!("{}/Core/APIHeader:{}/Core/APIHeader/c++/v1", sysroot_str, sysroot_str));
+    command.env("LIBRARY_PATH", format!("{}/Core/LibKit", sysroot_str));
+    command.env("PKG_CONFIG_SYSROOT_DIR", sysroot_str);
+    // Inherit host's HOME for cargo/rustup
+    if let Ok(home) = std::env::var("HOME") {
+        command.env("CARGO_HOME", format!("{}/.cargo", home));
+        command.env("RUSTUP_HOME", format!("{}/.rustup", home));
+    }
     for (k, v) in envs {
         command.env(k, v);
     }
