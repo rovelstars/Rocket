@@ -144,6 +144,12 @@ pub fn setup_mounts(sysroot: &Path, enable_host_links: bool) -> Result<(), Strin
 // even if the sandbox process is killed, no host mounts are affected.
 
 /// Enter the sandbox with chroot (root mode)
+///
+/// No fork - we unshare + chroot + execve directly in this process.
+/// This preserves the terminal session/process group so interactive
+/// shells (bash, brush) get proper job control. The mount namespace
+/// is automatically cleaned up when this process exits (via execve
+/// replacement or normal exit).
 fn enter_chroot(
     sysroot_raw: &Path,
     cmd: &[&str],
@@ -153,107 +159,59 @@ fn enter_chroot(
     let sysroot = sysroot_raw
         .canonicalize()
         .map_err(|e| format!("canonicalize sysroot {:?}: {}", sysroot_raw, e))?;
-    // SAFETY: We fork FIRST, then only the child enters new namespaces.
-    // This prevents the parent process (and host) from being affected
-    // if the child crashes or is killed before cleanup.
-    match unsafe { nix::unistd::fork() } {
-        Ok(nix::unistd::ForkResult::Parent { child, .. }) => {
-            // Parent just waits - child handles its own namespaces
-            let status =
-                nix::sys::wait::waitpid(child, None).map_err(|e| format!("waitpid: {}", e))?;
-            match status {
-                nix::sys::wait::WaitStatus::Exited(_, code) => Ok(code),
-                _ => Ok(1),
-            }
-        }
-        Ok(nix::unistd::ForkResult::Child) => {
-            // Enter isolated mount + UTS namespace
-            unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
-                .map_err(|e| {
-                    eprintln!("unshare failed: {}", e);
-                    std::process::exit(1);
-                })
-                .unwrap();
 
-            // Make all existing mounts private so our bind mounts
-            // don't propagate back to the host
-            mount(
-                None::<&str>,
-                "/",
-                None::<&str>,
-                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-                None::<&str>,
-            )
-            .map_err(|e| {
-                eprintln!("make-private /: {}", e);
-                std::process::exit(1);
-            })
-            .unwrap();
+    // Enter isolated mount + UTS namespace (no fork needed -
+    // unshare only affects this process, and mounts are private)
+    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
+        .map_err(|e| format!("unshare: {}", e))?;
 
-            if let Err(e) = setup_mounts(&sysroot, enable_host_links) {
-                eprintln!("setup_mounts: {}", e);
-                std::process::exit(1);
-            }
+    // Make all existing mounts private so our bind mounts
+    // don't propagate back to the host
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .map_err(|e| format!("make-private /: {}", e))?;
 
-            chroot(&sysroot)
-                .map_err(|e| {
-                    eprintln!("chroot: {}", e);
-                    std::process::exit(1);
-                })
-                .unwrap();
-            chdir("/")
-                .map_err(|e| {
-                    eprintln!("chdir /: {}", e);
-                    std::process::exit(1);
-                })
-                .unwrap();
-            let _ = sethostname("runixos");
+    setup_mounts(&sysroot, enable_host_links)?;
 
-            // Become session leader and acquire controlling terminal
-            // This is needed for shells (like brush/bash) that use job control
-            // - without it, read(stdin) returns EIO
-            let _ = nix::unistd::setsid();
-            // TIOCSCTTY: acquire controlling terminal
-            unsafe {
-                nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0);
-            }
+    chroot(&sysroot).map_err(|e| format!("chroot: {}", e))?;
+    chdir("/").map_err(|e| format!("chdir /: {}", e))?;
+    let _ = sethostname("runixos");
 
-            // Build argv for execve
-            let argv: Vec<CString> = cmd.iter().map(|s| CString::new(*s).unwrap()).collect();
+    // Build argv for execve
+    let argv: Vec<CString> = cmd.iter().map(|s| CString::new(*s).unwrap()).collect();
 
-            // Build envp for execve
-            let term = std::env::var("TERM").unwrap_or("xterm".into());
-            let mut env_strings = vec![format!("HOME=/Space/builder"), format!("TERM={}", term)];
+    // Build envp for execve
+    let term = std::env::var("TERM").unwrap_or("xterm".into());
+    let mut env_strings = vec![format!("HOME=/Space/builder"), format!("TERM={}", term)];
 
-            if enable_host_links {
-                env_strings.push(format!("PATH=/Core/Bin:/Construct/Bin:/host/bin"));
-                env_strings.push(format!(
-                    "LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib"
-                ));
-            } else {
-                env_strings.push(format!("PATH=/Core/Bin:/Construct/Bin"));
-                env_strings.push(format!("LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit"));
-            }
-
-            for (k, v) in envs {
-                env_strings.push(format!("{}={}", k, v));
-            }
-            let envp: Vec<CString> = env_strings
-                .iter()
-                .map(|s| CString::new(s.as_str()).unwrap())
-                .collect();
-
-            // execve replaces this process with the shell
-            execve(&argv[0], &argv, &envp)
-                .map_err(|e| {
-                    eprintln!("execve {:?}: {}", cmd[0], e);
-                    std::process::exit(1);
-                })
-                .unwrap();
-            unreachable!();
-        }
-        Err(e) => Err(format!("fork: {}", e)),
+    if enable_host_links {
+        env_strings.push(format!("PATH=/Core/Bin:/Construct/Bin:/host/bin"));
+        env_strings.push(format!(
+            "LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit:/host/lib:/host/syslib"
+        ));
+    } else {
+        env_strings.push(format!("PATH=/Core/Bin:/Construct/Bin"));
+        env_strings.push(format!("LD_LIBRARY_PATH=/Core/LibKit:/Construct/LibKit"));
     }
+
+    for (k, v) in envs {
+        env_strings.push(format!("{}={}", k, v));
+    }
+    let envp: Vec<CString> = env_strings
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect();
+
+    // execve replaces this process with the shell - terminal
+    // session and process group are inherited naturally
+    execve(&argv[0], &argv, &envp)
+        .map_err(|e| format!("execve {:?}: {}", cmd[0], e))?;
+    unreachable!();
 }
 
 /// Enter the sandbox with user namespaces (non-root mode)
@@ -488,7 +446,7 @@ pub fn enter_interactive(
     } else if sysroot.join("Core/Bin/nu").exists() {
         ("/Core/Bin/nu", &[])
     } else if enable_host_links {
-        ("/host/bin/sh", &["-i"])
+        ("/host/bin/bash", &["-i"])
     } else {
         return Err(
             "No RunixOS shell found (brush or nu). Use --enable-host-links for host fallback."
