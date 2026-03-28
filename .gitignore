@@ -1,3 +1,5 @@
 /target
 /local_output
 /build
+/output
+a.out
