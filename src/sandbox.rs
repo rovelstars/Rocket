@@ -1,8 +1,8 @@
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
-use nix::unistd::{chdir, chroot, execve, sethostname};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, chdir, chroot, execve, fork, sethostname};
 use std::ffi::CString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -14,7 +14,11 @@ const HOST_MOUNTS: &[(&str, &str)] = &[
 ];
 
 /// Set up the sandbox filesystem
-pub fn setup_mounts(sysroot: &Path, enable_host_links: bool) -> Result<(), String> {
+pub fn setup_mounts(
+    sysroot: &Path,
+    enable_host_links: bool,
+    binds: &[(std::path::PathBuf, String)],
+) -> Result<(), String> {
     let dev_dir = sysroot.join("dev");
     std::fs::create_dir_all(&dev_dir).map_err(|e| format!("mkdir dev: {}", e))?;
 
@@ -126,6 +130,21 @@ pub fn setup_mounts(sysroot: &Path, enable_host_links: bool) -> Result<(), Strin
         .ok();
     }
 
+    // Caller-requested bind mounts (e.g. a local source tree for --local).
+    // Targets live under Transit/Build (real disk), not the tmpfs below.
+    for (source, target) in binds {
+        let full = sysroot.join(target);
+        std::fs::create_dir_all(&full).map_err(|e| format!("mkdir bind {:?}: {}", full, e))?;
+        mount(
+            Some(source.as_path()),
+            &full,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| format!("bind mount {:?} -> {:?}: {}", source, full, e))?;
+    }
+
     // Mount tmpfs for /Transit/Ephemeral
     mount(
         Some("tmpfs"),
@@ -143,22 +162,57 @@ pub fn setup_mounts(sysroot: &Path, enable_host_links: bool) -> Result<(), Strin
 // kernel destroys when the child process exits. This is crash-safe:
 // even if the sandbox process is killed, no host mounts are affected.
 
-/// Enter the sandbox with chroot (root mode)
+/// Enter the sandbox with chroot (root mode).
 ///
-/// No fork - we unshare + chroot + execve directly in this process.
-/// This preserves the terminal session/process group so interactive
-/// shells (bash, brush) get proper job control. The mount namespace
-/// is automatically cleaned up when this process exits (via execve
-/// replacement or normal exit).
+/// Interactive shells exec in place (no fork) so they keep the terminal
+/// session/process group for job control. Non-interactive builds fork: the
+/// child sets up the namespace + chroot and execs the build, while the parent
+/// waits and returns the exit code - so the caller regains control to copy out
+/// artifacts. The mount namespace is private and torn down by the kernel when
+/// the child exits.
 fn enter_chroot(
     sysroot_raw: &Path,
     cmd: &[&str],
     envs: &[(&str, &str)],
     enable_host_links: bool,
+    interactive: bool,
+    binds: &[(std::path::PathBuf, String)],
 ) -> Result<i32, String> {
     let sysroot = sysroot_raw
         .canonicalize()
         .map_err(|e| format!("canonicalize sysroot {:?}: {}", sysroot_raw, e))?;
+
+    if interactive {
+        do_chroot_exec(&sysroot, cmd, envs, enable_host_links, binds)?;
+        unreachable!();
+    }
+
+    match unsafe { fork() }.map_err(|e| format!("fork: {}", e))? {
+        ForkResult::Child => {
+            if let Err(e) = do_chroot_exec(&sysroot, cmd, envs, enable_host_links, binds) {
+                eprintln!("sandbox child: {}", e);
+                std::process::exit(127);
+            }
+            unreachable!();
+        }
+        ForkResult::Parent { child } => match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, code)) => Ok(code),
+            Ok(WaitStatus::Signaled(_, sig, _)) => Ok(128 + sig as i32),
+            Ok(_) => Ok(1),
+            Err(e) => Err(format!("waitpid: {}", e)),
+        },
+    }
+}
+
+/// Set up the namespace + chroot in the current process and exec `cmd`.
+/// On success this never returns (execve replaces the process image).
+fn do_chroot_exec(
+    sysroot: &Path,
+    cmd: &[&str],
+    envs: &[(&str, &str)],
+    enable_host_links: bool,
+    binds: &[(std::path::PathBuf, String)],
+) -> Result<i32, String> {
 
     // Enter isolated mount + UTS namespace (no fork needed -
     // unshare only affects this process, and mounts are private)
@@ -176,9 +230,9 @@ fn enter_chroot(
     )
     .map_err(|e| format!("make-private /: {}", e))?;
 
-    setup_mounts(&sysroot, enable_host_links)?;
+    setup_mounts(sysroot, enable_host_links, binds)?;
 
-    chroot(&sysroot).map_err(|e| format!("chroot: {}", e))?;
+    chroot(sysroot).map_err(|e| format!("chroot: {}", e))?;
     chdir("/").map_err(|e| format!("chdir /: {}", e))?;
     let _ = sethostname("runixos");
 
@@ -334,15 +388,15 @@ fn enter_userns(
             .unwrap_or(std::path::Path::new("/"))
             .join("coding/rovelos/rust/build/x86_64-unknown-linux-gnu");
         let stage1_rustc = rust_build.join("stage1/bin/rustc");
-        let stage1_std = rust_build.join("stage1-std/x86_64-rovelstars-runixos/release/deps");
+        let stage1_std = rust_build.join("stage1-std/x86_64-rovelstars-linux-runixos/release/deps");
         if stage1_rustc.exists() {
             command.env("RUNIXOS_RUSTC", stage1_rustc.to_str().unwrap());
             command.env("RUNIXOS_STD_DEPS", stage1_std.to_str().unwrap());
             command.env(
-                "CARGO_TARGET_X86_64_ROVELSTARS_RUNIXOS_LINKER",
+                "CARGO_TARGET_X86_64_ROVELSTARS_LINUX_RUNIXOS_LINKER",
                 format!("{}/Core/Bin/clang", sysroot_str),
             );
-            command.env("RUNIXOS_TARGET", "x86_64-rovelstars-runixos");
+            command.env("RUNIXOS_TARGET", "x86_64-rovelstars-linux-runixos");
         }
         let libc_path = std::path::Path::new(sysroot_str)
             .parent()
@@ -353,21 +407,21 @@ fn enter_userns(
         }
 
         command.env(
-            "CC_x86_64_rovelstars_runixos",
+            "CC_x86_64_rovelstars_linux_runixos",
             format!("{}/Core/Bin/clang", sysroot_str),
         );
         command.env(
-            "CXX_x86_64_rovelstars_runixos",
+            "CXX_x86_64_rovelstars_linux_runixos",
             format!("{}/Core/Bin/clang++", sysroot_str),
         );
         command.env(
-            "AR_x86_64_rovelstars_runixos",
+            "AR_x86_64_rovelstars_linux_runixos",
             format!("{}/Core/Bin/llvm-ar", sysroot_str),
         );
         command.env(
-            "CFLAGS_x86_64_rovelstars_runixos",
+            "CFLAGS_x86_64_rovelstars_linux_runixos",
             format!(
-                "--sysroot={} --target=x86_64-rovelstars-runixos",
+                "--sysroot={} --target=x86_64-rovelstars-linux-runixos",
                 sysroot_str
             ),
         );
@@ -415,10 +469,14 @@ pub fn run_in_sandbox(
     envs: &[(&str, &str)],
     is_root: bool,
     enable_host_links: bool,
+    interactive: bool,
+    binds: &[(std::path::PathBuf, String)],
 ) -> Result<i32, String> {
     if is_root {
-        enter_chroot(sysroot, cmd, envs, enable_host_links)
+        enter_chroot(sysroot, cmd, envs, enable_host_links, interactive, binds)
     } else {
+        // Non-root mode runs natively (no chroot); binds are unnecessary
+        // because build.sh sees host paths directly via $LOCAL_SRC.
         enter_userns(sysroot, cmd, envs, enable_host_links)
     }
 }
@@ -456,7 +514,8 @@ pub fn enter_interactive(
 
     let mut cmd = vec![shell];
     cmd.extend_from_slice(shell_args);
-    let code = run_in_sandbox(sysroot, &cmd, &[], is_root, enable_host_links)?;
+    // Interactive: exec in place to keep job control. No binds.
+    let code = run_in_sandbox(sysroot, &cmd, &[], is_root, enable_host_links, true, &[])?;
     if code != 0 {
         Err(format!("Shell exited with code {}", code))
     } else {

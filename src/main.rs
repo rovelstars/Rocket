@@ -28,6 +28,10 @@ enum Command {
         /// Path to RunixOS sysroot (build environment)
         #[arg(short, long, default_value = "/home/ren/ROS")]
         sysroot: PathBuf,
+        /// Build a local working tree instead of cloning upstream
+        /// (overrides meta.toml `local_path`). Exposed to build.sh as $LOCAL_SRC.
+        #[arg(short, long)]
+        local: Option<PathBuf>,
     },
     /// Build all packages
     BuildAll {
@@ -64,7 +68,7 @@ fn main() {
     }
 
     match cli.command {
-        Command::Build { package, planets, output, sysroot } => {
+        Command::Build { package, planets, output, sysroot, local } => {
             let pkg_dir = planets.join("packages").join(&package);
             if !pkg_dir.exists() {
                 eprintln!("{} Package '{}' not found at {:?}", "Error:".red().bold(), package, pkg_dir);
@@ -73,7 +77,7 @@ fn main() {
             match config::load_package(&pkg_dir) {
                 Ok(pkg) => {
                     println!("{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
-                    if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root) {
+                    if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root, local.as_deref()) {
                         eprintln!("{} {}", "Build failed:".red().bold(), e);
                         std::process::exit(1);
                     }
@@ -100,7 +104,7 @@ fn main() {
                 match config::load_package(&pkg_dir) {
                     Ok(pkg) => {
                         println!("\n{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
-                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root) {
+                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root, None) {
                             eprintln!("{} {}: {}", "Failed:".red().bold(), name, e);
                         }
                     }
