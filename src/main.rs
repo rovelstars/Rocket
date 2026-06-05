@@ -93,7 +93,6 @@ fn build_in_order(
     order: &[String],
     sysroot: &std::path::Path,
     output: &std::path::Path,
-    is_root: bool,
     install: bool,
     local_for: impl Fn(&str) -> Option<PathBuf>,
 ) {
@@ -108,7 +107,7 @@ fn build_in_order(
         };
         println!("\n{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
         let loc = local_for(name);
-        if let Err(e) = builder::build_package(pkg, sysroot, output, is_root, loc.as_deref(), install) {
+        if let Err(e) = builder::build_package(pkg, sysroot, output, loc.as_deref(), install) {
             eprintln!("{} {}: {}", "Failed:".red().bold(), name, e);
             eprintln!(
                 "{} built {}/{} before stopping at {}",
@@ -126,13 +125,6 @@ fn build_in_order(
 
 fn main() {
     let cli = Cli::parse();
-    let is_root = nix::unistd::geteuid().is_root();
-
-    if !is_root {
-        eprintln!("{}", "TIP: Running with sudo enables chroot mode which is faster for large builds.".yellow());
-        eprintln!("{}", "     Use: sudo rocket build <package>".yellow());
-        eprintln!();
-    }
 
     match cli.command {
         Command::Build { package, planets, output, sysroot, local, with_deps, install } => {
@@ -153,7 +145,7 @@ fn main() {
                 // Dependencies must be installed into the sysroot so the target
                 // can build against them, so a closure build always installs.
                 // local override only applies to the named target, not its deps.
-                build_in_order(&pkgs, &order, &sysroot, &output, is_root, true, |n| {
+                build_in_order(&pkgs, &order, &sysroot, &output, true, |n| {
                     if n == package { local.clone() } else { None }
                 });
             } else {
@@ -165,7 +157,7 @@ fn main() {
                 match config::load_package(&pkg_dir) {
                     Ok(pkg) => {
                         println!("{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
-                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root, local.as_deref(), install) {
+                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, local.as_deref(), install) {
                             eprintln!("{} {}", "Build failed:".red().bold(), e);
                             std::process::exit(1);
                         }
@@ -191,7 +183,7 @@ fn main() {
                 }
             };
             println!("{} {} packages in dependency order", "Building".green().bold(), order.len());
-            build_in_order(&pkgs, &order, &sysroot, &output, is_root, !no_install, |_| None);
+            build_in_order(&pkgs, &order, &sysroot, &output, !no_install, |_| None);
         }
         Command::Deps { packages, planets } => {
             let (pkgs, errors) = load_all_or_exit(&planets);
@@ -232,7 +224,7 @@ fn main() {
         Command::Enter { sysroot, enable_host_links } => {
             println!("{} RunixOS sandbox at {:?}{}", "Entering".cyan().bold(), sysroot,
                 if enable_host_links { " (host links enabled)" } else { "" });
-            if let Err(e) = sandbox::enter_interactive(&sysroot, is_root, enable_host_links) {
+            if let Err(e) = sandbox::enter_interactive(&sysroot, enable_host_links) {
                 eprintln!("{} {}", "Error:".red().bold(), e);
                 std::process::exit(1);
             }

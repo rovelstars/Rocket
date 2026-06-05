@@ -12,7 +12,6 @@ pub fn build_package(
     pkg: &Package,
     sysroot: &Path,
     output: &Path,
-    is_root: bool,
     local_src: Option<&Path>,
     install_to_sysroot: bool,
 ) -> Result<(), String> {
@@ -61,40 +60,27 @@ pub fn build_package(
     // We inject [patch.crates-io] into each project's Cargo.toml at build time.
     // This is done in build.sh via the RUNIXOS_LIBC_PATH env var.
 
-    // Paths: in root mode, use absolute /Transit/Build/<pkg> (chroot'd).
-    // In non-root mode, use sysroot-prefixed host paths.
+    // The build runs chroot'd to the sysroot, so all build paths are absolute
+    // inside the chroot. The host-side equivalents (src_dir/out_dir) are only
+    // used by this process to stage build.sh and to copy artifacts out.
     let pkg_build = format!("/Transit/Build/{}", pkg.meta.name);
-    let (src_path, out_path, patches_path) = if is_root {
-        (
-            pkg_build.clone(),
-            format!("{}/_out", pkg_build),
-            format!("{}/patches", pkg_build),
-        )
-    } else {
-        (
-            src_dir.to_string_lossy().to_string(),
-            out_dir.to_string_lossy().to_string(),
-            src_dir.join("patches").to_string_lossy().to_string(),
-        )
-    };
+    let src_path = pkg_build.clone();
+    let out_path = format!("{}/_out", pkg_build);
+    let patches_path = format!("{}/patches", pkg_build);
 
-    // Local-source plumbing. In root mode the chroot can't see host paths, so
-    // bind-mount the local tree to <build>/src and point $LOCAL_SRC at it. In
-    // non-root mode $LOCAL_SRC is just the canonical host path.
+    // Local-source plumbing: bind the host tree to <build>/src inside the chroot
+    // and point $LOCAL_SRC at it (the chroot cannot see arbitrary host paths).
     let mut binds: Vec<(std::path::PathBuf, String)> = Vec::new();
     let local_src_env: Option<String> = local_canon.as_ref().map(|lc| {
-        if is_root {
-            binds.push((lc.clone(), format!("Transit/Build/{}/src", pkg.meta.name)));
-            format!("{}/src", pkg_build)
-        } else {
-            lc.to_string_lossy().to_string()
-        }
+        binds.push((lc.clone(), format!("Transit/Build/{}/src", pkg.meta.name)));
+        format!("{}/src", pkg_build)
     });
     if let Some(ref ls) = local_src_env {
         println!("  Local source: {}", ls);
     }
 
-    // Build environment variables from meta.toml
+    // Build environment variables from meta.toml. SYSROOT is "/" because the
+    // build is chroot'd into the sysroot, so $SYSROOT/Core/Bin/clang etc resolve.
     let mut envs: Vec<(String, String)> = vec![
         ("NAME".into(), pkg.meta.name.clone()),
         ("VERSION".into(), pkg.meta.version.clone()),
@@ -102,7 +88,7 @@ pub fn build_package(
         ("OUTPUT".into(), out_path.clone()),
         ("SRC".into(), src_path.clone()),
         ("PATCHES".into(), patches_path.clone()),
-        ("SYSROOT".into(), sysroot.to_string_lossy().to_string()),
+        ("SYSROOT".into(), "/".into()),
         ("JOBS".into(), num_cpus().to_string()),
         ("ROCKET_OUTPUT".into(), output.parent().unwrap_or(output).to_string_lossy().to_string()),
     ];
@@ -138,10 +124,9 @@ pub fn build_package(
 
     let code = sandbox::run_in_sandbox(
         sysroot,
-        &["/host/bin/sh", "-e", "-c", &build_cmd],
+        &["/bin/sh", "-e", "-c", &build_cmd],
         &env_refs,
-        is_root,
-        true, // builds always need host tools (cargo, rustc, etc.)
+        true,  // builds need host tools (gcc, make, cmake, curl) bound in
         false, // non-interactive: fork so we regain control to copy artifacts
         &binds,
     )?;
