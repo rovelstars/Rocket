@@ -40,6 +40,9 @@ enum Command {
         /// (Always on with --with-deps and for build-all.)
         #[arg(long)]
         install: bool,
+        /// Rebuild even if the build cache says it is unchanged.
+        #[arg(long)]
+        force: bool,
     },
     /// Build all packages
     BuildAll {
@@ -53,6 +56,9 @@ enum Command {
         /// (Inter-package dependencies will not resolve; for debugging only.)
         #[arg(long)]
         no_install: bool,
+        /// Rebuild every package, ignoring the build cache.
+        #[arg(long)]
+        force: bool,
     },
     /// List available packages
     List {
@@ -94,6 +100,7 @@ fn build_in_order(
     sysroot: &std::path::Path,
     output: &std::path::Path,
     install: bool,
+    force: bool,
     local_for: impl Fn(&str) -> Option<PathBuf>,
 ) {
     use std::collections::HashMap;
@@ -107,7 +114,7 @@ fn build_in_order(
         };
         println!("\n{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
         let loc = local_for(name);
-        if let Err(e) = builder::build_package(pkg, sysroot, output, loc.as_deref(), install) {
+        if let Err(e) = builder::build_package(pkg, sysroot, output, loc.as_deref(), install, force) {
             eprintln!("{} {}: {}", "Failed:".red().bold(), name, e);
             eprintln!(
                 "{} built {}/{} before stopping at {}",
@@ -127,7 +134,7 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { package, planets, output, sysroot, local, with_deps, install } => {
+        Command::Build { package, planets, output, sysroot, local, with_deps, install, force } => {
             if with_deps {
                 // Build the dependency closure in order; the target builds last.
                 let (pkgs, errors) = load_all_or_exit(&planets);
@@ -145,7 +152,7 @@ fn main() {
                 // Dependencies must be installed into the sysroot so the target
                 // can build against them, so a closure build always installs.
                 // local override only applies to the named target, not its deps.
-                build_in_order(&pkgs, &order, &sysroot, &output, true, |n| {
+                build_in_order(&pkgs, &order, &sysroot, &output, true, force, |n| {
                     if n == package { local.clone() } else { None }
                 });
             } else {
@@ -157,7 +164,7 @@ fn main() {
                 match config::load_package(&pkg_dir) {
                     Ok(pkg) => {
                         println!("{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
-                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, local.as_deref(), install) {
+                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, local.as_deref(), install, force) {
                             eprintln!("{} {}", "Build failed:".red().bold(), e);
                             std::process::exit(1);
                         }
@@ -170,7 +177,7 @@ fn main() {
                 }
             }
         }
-        Command::BuildAll { planets, output, sysroot, no_install } => {
+        Command::BuildAll { planets, output, sysroot, no_install, force } => {
             let (pkgs, errors) = load_all_or_exit(&planets);
             for e in &errors {
                 eprintln!("{} {}", "Skip:".yellow(), e);
@@ -183,7 +190,7 @@ fn main() {
                 }
             };
             println!("{} {} packages in dependency order", "Building".green().bold(), order.len());
-            build_in_order(&pkgs, &order, &sysroot, &output, !no_install, |_| None);
+            build_in_order(&pkgs, &order, &sysroot, &output, !no_install, force, |_| None);
         }
         Command::Deps { packages, planets } => {
             let (pkgs, errors) = load_all_or_exit(&planets);

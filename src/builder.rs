@@ -14,6 +14,7 @@ pub fn build_package(
     output: &Path,
     local_src: Option<&Path>,
     install_to_sysroot: bool,
+    force: bool,
 ) -> Result<(), String> {
     // Create output directory
     std::fs::create_dir_all(output)
@@ -28,10 +29,6 @@ pub fn build_package(
     std::fs::create_dir_all(&src_dir)
         .map_err(|e| format!("mkdir build dir: {}", e))?;
 
-    // Fresh output dir each run so stale installs don't leak into artifacts.
-    let out_dir = src_dir.join("_out");
-    let _ = std::fs::remove_dir_all(&out_dir);
-
     // Resolve local source: CLI override first, then meta.toml local_path
     // (resolved relative to the package directory).
     let local_resolved: Option<std::path::PathBuf> = match local_src {
@@ -44,6 +41,25 @@ pub fn build_package(
             .map_err(|e| format!("local source {:?}: {}", p, e))?),
         None => None,
     };
+
+    // Build cache. The package's build is keyed by its build.sh + meta.toml and,
+    // for a local-source package, the git state of that tree. If that matches the
+    // last successful install and --force was not given, skip: the package is
+    // already in the sysroot. Only applies when installing (a non-install build
+    // leaves nothing in the sysroot to reuse).
+    let stamp = src_dir.join(".rocket-stamp");
+    let key = build_key(pkg, local_canon.as_deref());
+    if install_to_sysroot
+        && !force
+        && std::fs::read_to_string(&stamp).map(|p| p.trim() == key).unwrap_or(false)
+    {
+        println!("  Skipped (cached, unchanged; --force to rebuild)");
+        return Ok(());
+    }
+
+    // Fresh output dir each run so stale installs don't leak into artifacts.
+    let out_dir = src_dir.join("_out");
+    let _ = std::fs::remove_dir_all(&out_dir);
 
     // Copy build.sh into the build directory
     let build_sh_dest = src_dir.join("build.sh");
@@ -161,8 +177,38 @@ pub fn build_package(
         ));
     }
 
+    // Record the successful install so an unchanged rebuild can be skipped.
+    if install_to_sysroot {
+        let _ = std::fs::write(&stamp, &key);
+    }
+
     // Build directory is intentionally kept for incremental rebuilds.
     Ok(())
+}
+
+/// Content key for the build cache: the build script + meta.toml, plus the git
+/// state of the local source tree (HEAD + uncommitted diff + untracked list) so
+/// that editing a ported tree (llvm-project, glibc, ...) invalidates the cache.
+fn build_key(pkg: &Package, local: Option<&Path>) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::fs::read(&pkg.build_script).unwrap_or_default().hash(&mut h);
+    std::fs::read(pkg.pkg_dir.join("meta.toml")).unwrap_or_default().hash(&mut h);
+    if let Some(l) = local {
+        let l = l.to_string_lossy().to_string();
+        let runs: [&[&str]; 3] = [
+            &["rev-parse", "HEAD"],
+            &["diff", "HEAD"],
+            &["status", "--porcelain"],
+        ];
+        for r in runs {
+            if let Ok(o) = std::process::Command::new("git").arg("-C").arg(&l).args(r).output() {
+                o.stdout.hash(&mut h);
+            }
+        }
+    }
+    format!("{:016x}", h.finish())
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
