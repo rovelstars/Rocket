@@ -1,6 +1,7 @@
 mod config;
 mod sandbox;
 mod builder;
+mod resolver;
 
 use clap::Parser;
 use colored::Colorize;
@@ -32,6 +33,9 @@ enum Command {
         /// (overrides meta.toml `local_path`). Exposed to build.sh as $LOCAL_SRC.
         #[arg(short, long)]
         local: Option<PathBuf>,
+        /// Build this package's dependencies first, in order.
+        #[arg(long)]
+        with_deps: bool,
     },
     /// Build all packages
     BuildAll {
@@ -47,6 +51,13 @@ enum Command {
         #[arg(short, long, default_value = "../Planets")]
         planets: PathBuf,
     },
+    /// Print the resolved dependency build order (no building).
+    Deps {
+        /// Optional package(s); prints their dependency closure. Omit for all.
+        packages: Vec<String>,
+        #[arg(short, long, default_value = "../Planets")]
+        planets: PathBuf,
+    },
     /// Enter the RunixOS sandbox interactively
     Enter {
         #[arg(short, long, default_value = "/home/ren/ROS")]
@@ -55,6 +66,53 @@ enum Command {
         #[arg(long)]
         enable_host_links: bool,
     },
+}
+
+fn load_all_or_exit(planets: &std::path::Path) -> (Vec<config::Package>, Vec<String>) {
+    match config::load_all(&planets.join("packages")) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build packages in the given order, fail-fast with a summary. `local_for`
+/// supplies an optional local-source override per package name.
+fn build_in_order(
+    pkgs: &[config::Package],
+    order: &[String],
+    sysroot: &std::path::Path,
+    output: &std::path::Path,
+    is_root: bool,
+    local_for: impl Fn(&str) -> Option<PathBuf>,
+) {
+    use std::collections::HashMap;
+    let by_name: HashMap<&str, &config::Package> =
+        pkgs.iter().map(|p| (p.meta.name.as_str(), p)).collect();
+    let mut built = 0usize;
+    for name in order {
+        let Some(pkg) = by_name.get(name.as_str()) else {
+            eprintln!("{} {} (no package dir)", "Failed:".red().bold(), name);
+            std::process::exit(1);
+        };
+        println!("\n{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
+        let loc = local_for(name);
+        if let Err(e) = builder::build_package(pkg, sysroot, output, is_root, loc.as_deref()) {
+            eprintln!("{} {}: {}", "Failed:".red().bold(), name, e);
+            eprintln!(
+                "{} built {}/{} before stopping at {}",
+                "Summary:".yellow(),
+                built,
+                order.len(),
+                name
+            );
+            std::process::exit(1);
+        }
+        built += 1;
+    }
+    println!("\n{} built {}/{} packages", "Done:".green().bold(), built, order.len());
 }
 
 fn main() {
@@ -68,47 +126,77 @@ fn main() {
     }
 
     match cli.command {
-        Command::Build { package, planets, output, sysroot, local } => {
-            let pkg_dir = planets.join("packages").join(&package);
-            if !pkg_dir.exists() {
-                eprintln!("{} Package '{}' not found at {:?}", "Error:".red().bold(), package, pkg_dir);
-                std::process::exit(1);
-            }
-            match config::load_package(&pkg_dir) {
-                Ok(pkg) => {
-                    println!("{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
-                    if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root, local.as_deref()) {
-                        eprintln!("{} {}", "Build failed:".red().bold(), e);
+        Command::Build { package, planets, output, sysroot, local, with_deps } => {
+            if with_deps {
+                // Build the dependency closure in order; the target builds last.
+                let (pkgs, errors) = load_all_or_exit(&planets);
+                for e in &errors {
+                    eprintln!("{} {}", "Skip:".yellow(), e);
+                }
+                let order = match resolver::resolve_order(&pkgs, Some(&[package.clone()])) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("{} {}", "Dependency error:".red().bold(), e);
                         std::process::exit(1);
                     }
-                    println!("{} {} v{}", "Completed".green().bold(), pkg.meta.name, pkg.meta.version);
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to load package: {}", "Error:".red().bold(), e);
+                };
+                println!("{} {} (closure of {})", "Build order:".cyan().bold(), order.join(" -> "), package);
+                // local override only applies to the named target, not its deps.
+                build_in_order(&pkgs, &order, &sysroot, &output, is_root, |n| {
+                    if n == package { local.clone() } else { None }
+                });
+            } else {
+                let pkg_dir = planets.join("packages").join(&package);
+                if !pkg_dir.exists() {
+                    eprintln!("{} Package '{}' not found at {:?}", "Error:".red().bold(), package, pkg_dir);
                     std::process::exit(1);
+                }
+                match config::load_package(&pkg_dir) {
+                    Ok(pkg) => {
+                        println!("{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
+                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root, local.as_deref()) {
+                            eprintln!("{} {}", "Build failed:".red().bold(), e);
+                            std::process::exit(1);
+                        }
+                        println!("{} {} v{}", "Completed".green().bold(), pkg.meta.name, pkg.meta.version);
+                    }
+                    Err(e) => {
+                        eprintln!("{} Failed to load package: {}", "Error:".red().bold(), e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
         Command::BuildAll { planets, output, sysroot } => {
-            let pkgs_dir = planets.join("packages");
-            let mut packages: Vec<String> = std::fs::read_dir(&pkgs_dir)
-                .expect("Cannot read packages directory")
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            packages.sort();
-            println!("{} {} packages", "Building".green().bold(), packages.len());
-            for name in &packages {
-                let pkg_dir = pkgs_dir.join(name);
-                match config::load_package(&pkg_dir) {
-                    Ok(pkg) => {
-                        println!("\n{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
-                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, is_root, None) {
-                            eprintln!("{} {}: {}", "Failed:".red().bold(), name, e);
-                        }
+            let (pkgs, errors) = load_all_or_exit(&planets);
+            for e in &errors {
+                eprintln!("{} {}", "Skip:".yellow(), e);
+            }
+            let order = match resolver::resolve_order(&pkgs, None) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("{} {}", "Dependency error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            };
+            println!("{} {} packages in dependency order", "Building".green().bold(), order.len());
+            build_in_order(&pkgs, &order, &sysroot, &output, is_root, |_| None);
+        }
+        Command::Deps { packages, planets } => {
+            let (pkgs, errors) = load_all_or_exit(&planets);
+            for e in &errors {
+                eprintln!("{} {}", "Skip:".yellow(), e);
+            }
+            let targets = if packages.is_empty() { None } else { Some(packages.as_slice()) };
+            match resolver::resolve_order(&pkgs, targets) {
+                Ok(order) => {
+                    for (i, name) in order.iter().enumerate() {
+                        println!("  {:>2}. {}", i + 1, name.green());
                     }
-                    Err(e) => eprintln!("{} {}: {}", "Skip:".yellow(), name, e),
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Dependency error:".red().bold(), e);
+                    std::process::exit(1);
                 }
             }
         }
