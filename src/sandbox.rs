@@ -128,6 +128,20 @@ pub fn setup_mounts(
     )
     .map_err(|e| format!("tmpfs Transit/Ephemeral: {}", e))?;
 
+    // A writable /tmp (1777). Host build tools (clang, configure scripts) create
+    // temp files in /tmp by default, and the chroot's sysroot has no /tmp of its
+    // own. Without this, clang fails with "unable to make temporary file".
+    let tmp = sysroot.join("tmp");
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("mkdir tmp: {}", e))?;
+    mount(
+        Some("tmpfs"),
+        &tmp,
+        Some("tmpfs"),
+        MsFlags::empty(),
+        Some("size=4G,mode=1777"),
+    )
+    .map_err(|e| format!("tmpfs /tmp: {}", e))?;
+
     Ok(())
 }
 
