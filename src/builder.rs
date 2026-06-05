@@ -14,6 +14,7 @@ pub fn build_package(
     output: &Path,
     is_root: bool,
     local_src: Option<&Path>,
+    install_to_sysroot: bool,
 ) -> Result<(), String> {
     // Create output directory
     std::fs::create_dir_all(output)
@@ -158,6 +159,21 @@ pub fn build_package(
             .map_err(|e| format!("mkdir pkg output: {}", e))?;
         copy_dir_recursive(&out_dir, &pkg_output)?;
         println!("  Output: {:?}", pkg_output);
+
+        // Merge the output into the sysroot so packages built later in a
+        // dependency-ordered run can find this package's headers and libraries
+        // (e.g. curl needs openssl in Core/LibKit + Core/APIHeader). Without
+        // this, every package builds against an unchanging sysroot and inter
+        // package dependencies never resolve.
+        if install_to_sysroot {
+            copy_dir_recursive(&out_dir, sysroot)?;
+            println!("  Installed into sysroot: {:?}", sysroot);
+        }
+    } else if install_to_sysroot {
+        return Err(format!(
+            "nothing to install: {} produced no output at {:?}",
+            pkg.meta.name, out_dir
+        ));
     }
 
     // Build directory is intentionally kept for incremental rebuilds.
