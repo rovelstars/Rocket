@@ -230,6 +230,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             std::os::unix::fs::symlink(&target, &dst_path)
                 .map_err(|e| format!("symlink {:?} -> {:?}: {}", dst_path, target, e))?;
         } else {
+            // Remove any existing dst first: a read-only file (e.g. a 0444 CA
+            // bundle) cannot be overwritten in place by fs::copy.
+            let _ = std::fs::remove_file(&dst_path);
             std::fs::copy(&src_path, &dst_path)
                 .map_err(|e| format!("copy {:?}: {}", src_path, e))?;
             // fs::copy preserves rwx but drops special bits (setuid/setgid/sticky);
