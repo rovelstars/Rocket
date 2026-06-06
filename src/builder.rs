@@ -232,6 +232,15 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         } else {
             std::fs::copy(&src_path, &dst_path)
                 .map_err(|e| format!("copy {:?}: {}", src_path, e))?;
+            // fs::copy preserves rwx but drops special bits (setuid/setgid/sticky);
+            // reapply the full source mode so e.g. setuid-root binaries survive.
+            if let Ok(meta) = std::fs::metadata(&src_path) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &dst_path,
+                    std::fs::Permissions::from_mode(meta.permissions().mode()),
+                );
+            }
         }
     }
     Ok(())
