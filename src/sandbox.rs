@@ -11,14 +11,12 @@ use std::path::Path;
 /// at /Core/Bin. Cross-building needs both: host tools to drive the build, the
 /// sysroot clang to emit RunixOS code.
 const HOST_RO_DIRS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt"];
-/// Host files bind-mounted read-only so network fetches (git clone, curl) work.
-const HOST_RO_FILES: &[&str] = &[
-    "/etc/resolv.conf",
-    "/etc/hosts",
-    "/etc/ssl",
-    "/etc/ca-certificates",
-    "/etc/pki",
-];
+/// Network config bind-mounted ALWAYS (even without host links) so DNS works for
+/// RunixOS's own git/curl inside the sandbox. RunixOS ships its own CA bundle
+/// (/Core/Config/ssl/cert.pem) so the host trust store is not needed here.
+const HOST_NET_FILES: &[&str] = &["/etc/resolv.conf", "/etc/hosts"];
+/// Host trust store, bound only with host links (RunixOS ships its own).
+const HOST_RO_FILES: &[&str] = &["/etc/ssl", "/etc/ca-certificates", "/etc/pki"];
 
 /// We run unprivileged: a user namespace maps our real uid/gid to root inside,
 /// which lets us chroot + mount without sudo. The kernel tears the namespace
@@ -58,6 +56,29 @@ fn bind_ro(src: &Path, dst: &Path) -> Result<(), String> {
     .map_err(|e| format!("remount-ro {:?}: {}", dst, e))
 }
 
+/// Bind a set of host /etc files/dirs read-only into the sysroot (best-effort:
+/// a missing source or failed bind never aborts the build).
+fn bind_etc_files(sysroot: &Path, files: &[&str]) -> Result<(), String> {
+    std::fs::create_dir_all(sysroot.join("etc")).map_err(|e| format!("mkdir etc: {}", e))?;
+    for f in files {
+        let src = Path::new(f);
+        if !src.exists() {
+            continue;
+        }
+        let dst = sysroot.join(f.trim_start_matches('/'));
+        if src.is_dir() {
+            std::fs::create_dir_all(&dst).ok();
+        } else {
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p).ok();
+            }
+            let _ = std::fs::File::create(&dst);
+        }
+        let _ = bind_ro(src, &dst);
+    }
+    Ok(())
+}
+
 /// Set up the sandbox filesystem inside the (already private) mount namespace.
 pub fn setup_mounts(
     sysroot: &Path,
@@ -77,6 +98,9 @@ pub fn setup_mounts(
         bind(Path::new(src), &dst, true)?;
     }
 
+    // Always bind network config so DNS resolves for RunixOS's own git/curl.
+    bind_etc_files(sysroot, HOST_NET_FILES)?;
+
     if host_links {
         for dir in HOST_RO_DIRS {
             let src = Path::new(dir);
@@ -87,26 +111,8 @@ pub fn setup_mounts(
             std::fs::create_dir_all(&dst).map_err(|e| format!("mkdir {:?}: {}", dst, e))?;
             bind_ro(src, &dst)?;
         }
-        // Network/cert files for git clone + curl downloads.
-        let etc = sysroot.join("etc");
-        std::fs::create_dir_all(&etc).map_err(|e| format!("mkdir etc: {}", e))?;
-        for f in HOST_RO_FILES {
-            let src = Path::new(f);
-            if !src.exists() {
-                continue;
-            }
-            let dst = sysroot.join(f.trim_start_matches('/'));
-            if src.is_dir() {
-                std::fs::create_dir_all(&dst).ok();
-            } else {
-                if let Some(p) = dst.parent() {
-                    std::fs::create_dir_all(p).ok();
-                }
-                let _ = std::fs::File::create(&dst);
-            }
-            // Best-effort: a missing cert dir should not abort the build.
-            let _ = bind_ro(src, &dst);
-        }
+        // Host trust store (RunixOS ships its own CA bundle, so only with links).
+        bind_etc_files(sysroot, HOST_RO_FILES)?;
     }
 
     // Caller-requested bind mounts (e.g. a local source tree for --local).
@@ -219,6 +225,10 @@ fn do_enter(
     chroot(sysroot).map_err(|e| format!("chroot: {}", e))?;
     chdir("/").map_err(|e| format!("chdir /: {}", e))?;
 
+    // The build sandbox runs as root with HOME in the cache area (not /Space,
+    // which is for real user accounts). Ensure it exists for cargo/git/etc.
+    let _ = std::fs::create_dir_all("/Vault/Cache/builder");
+
     let argv: Vec<CString> = cmd.iter().map(|s| CString::new(*s).unwrap()).collect();
 
     let term = std::env::var("TERM").unwrap_or("xterm".into());
@@ -230,7 +240,7 @@ fn do_enter(
     // Defaults, then caller envs override by key (glibc getenv returns the first
     // match, so duplicates would not override - dedup explicitly).
     let mut pairs: Vec<(String, String)> = vec![
-        ("HOME".to_string(), "/Space/builder".to_string()),
+        ("HOME".to_string(), "/Vault/Cache/builder".to_string()),
         ("TERM".to_string(), term),
         ("PATH".to_string(), path.to_string()),
     ];
