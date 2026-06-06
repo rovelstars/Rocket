@@ -1,7 +1,7 @@
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, chdir, chroot, execve, fork, getgid, getuid, sethostname};
+use nix::unistd::{ForkResult, chdir, chroot, execve, fork, getgid, getuid};
 use std::ffi::CString;
 use std::path::Path;
 
@@ -218,7 +218,6 @@ fn do_enter(
 
     chroot(sysroot).map_err(|e| format!("chroot: {}", e))?;
     chdir("/").map_err(|e| format!("chdir /: {}", e))?;
-    let _ = sethostname("runixos");
 
     let argv: Vec<CString> = cmd.iter().map(|s| CString::new(*s).unwrap()).collect();
 
