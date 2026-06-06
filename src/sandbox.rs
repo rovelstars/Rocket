@@ -256,6 +256,20 @@ pub fn run_in_sandbox(
     enter_sandbox(sysroot, cmd, envs, host_links, interactive, binds)
 }
 
+/// True when the account store has no human (uid >= 1000) account yet. Read from
+/// the plaintext passwd projection so no decryption key is needed.
+fn needs_oobe(sysroot: &Path) -> bool {
+    match std::fs::read_to_string(sysroot.join("Vault/Accounts/passwd")) {
+        Ok(content) => !content.lines().any(|l| {
+            l.split(':')
+                .nth(2)
+                .and_then(|u| u.parse::<u32>().ok())
+                .is_some_and(|uid| uid >= 1000)
+        }),
+        Err(_) => true,
+    }
+}
+
 /// Enter an interactive shell in the sandbox.
 pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String> {
     if let Ok(release) = std::fs::read_to_string(sysroot.join("Core/Config/OSReleaseInfo")) {
@@ -267,7 +281,12 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
         }
     }
 
-    let (shell, shell_args): (&str, &[&str]) = if sysroot.join("Core/Bin/brush").exists() {
+    // No human account yet -> drop into out-of-box setup instead of a shell.
+    let oobe = sysroot.join("Core/Bin/oobe");
+    let (shell, shell_args): (&str, &[&str]) = if needs_oobe(sysroot) && oobe.exists() {
+        println!("  No user account found - starting setup.");
+        ("/Core/Bin/oobe", &[])
+    } else if sysroot.join("Core/Bin/brush").exists() {
         ("/Core/Bin/brush", &["--login", "-i"])
     } else if sysroot.join("Core/Bin/nu").exists() {
         ("/Core/Bin/nu", &[])
