@@ -227,14 +227,20 @@ fn do_enter(
     } else {
         "/Core/Bin:/Construct/Bin"
     };
-    let mut env_strings = vec![
-        "HOME=/Space/builder".to_string(),
-        format!("TERM={}", term),
-        format!("PATH={}", path),
+    // Defaults, then caller envs override by key (glibc getenv returns the first
+    // match, so duplicates would not override - dedup explicitly).
+    let mut pairs: Vec<(String, String)> = vec![
+        ("HOME".to_string(), "/Space/builder".to_string()),
+        ("TERM".to_string(), term),
+        ("PATH".to_string(), path.to_string()),
     ];
     for (k, v) in envs {
-        env_strings.push(format!("{}={}", k, v));
+        match pairs.iter_mut().find(|(ek, _)| ek == k) {
+            Some(e) => e.1 = v.to_string(),
+            None => pairs.push((k.to_string(), v.to_string())),
+        }
     }
+    let env_strings: Vec<String> = pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
     let envp: Vec<CString> = env_strings
         .iter()
         .map(|s| CString::new(s.as_str()).unwrap())
@@ -270,7 +276,27 @@ fn needs_oobe(sysroot: &Path) -> bool {
     }
 }
 
-/// Enter an interactive shell in the sandbox.
+/// First human account from the passwd projection: (name, home, shell).
+fn session_user(sysroot: &Path) -> Option<(String, String, String)> {
+    let content = std::fs::read_to_string(sysroot.join("Vault/Accounts/passwd")).ok()?;
+    for line in content.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() >= 7 {
+            if let Ok(uid) = f[2].parse::<u32>() {
+                if uid >= 1000 {
+                    return Some((f[0].to_string(), f[5].to_string(), f[6].to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Enter an interactive session in the sandbox. This stands in for Rev's session
+/// role: it runs OOBE if no account exists yet (setup only), then starts a login
+/// shell with the user's session environment ($USER, $HOME, $SHELL, ...). The
+/// real per-user privilege drop happens in Rev / a login manager; the single-uid
+/// build sandbox cannot switch uid, so here it only sets the environment.
 pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String> {
     if let Ok(release) = std::fs::read_to_string(sysroot.join("Core/Config/OSReleaseInfo")) {
         for line in release.lines() {
@@ -281,17 +307,30 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
         }
     }
 
-    // No human account yet -> drop into out-of-box setup instead of a shell.
+    // Out-of-box setup if there is no human account yet. oobe only creates the
+    // account; run it forked so control returns here for the actual session.
     let oobe = sysroot.join("Core/Bin/oobe");
-    let (shell, shell_args): (&str, &[&str]) = if needs_oobe(sysroot) && oobe.exists() {
+    if needs_oobe(sysroot) && oobe.exists() {
         println!("  No user account found - starting setup.");
-        ("/Core/Bin/oobe", &[])
+        run_in_sandbox(sysroot, &["/Core/Bin/oobe"], &[], host_links, false, &[])?;
+    }
+
+    // Session: log in as the human account (environment + their login shell).
+    let session = session_user(sysroot);
+    let user_shell = session
+        .as_ref()
+        .map(|(_, _, s)| s.clone())
+        .filter(|s| s.starts_with('/') && sysroot.join(s.trim_start_matches('/')).exists());
+
+    let (shell, shell_args): (String, Vec<&str>) = if let Some(s) = user_shell {
+        let args = if s.ends_with("/nu") { vec![] } else { vec!["--login", "-i"] };
+        (s, args)
     } else if sysroot.join("Core/Bin/brush").exists() {
-        ("/Core/Bin/brush", &["--login", "-i"])
+        ("/Core/Bin/brush".to_string(), vec!["--login", "-i"])
     } else if sysroot.join("Core/Bin/nu").exists() {
-        ("/Core/Bin/nu", &[])
+        ("/Core/Bin/nu".to_string(), vec![])
     } else if host_links {
-        ("/bin/bash", &["-i"])
+        ("/bin/bash".to_string(), vec!["-i"])
     } else {
         return Err(
             "No RunixOS shell found (brush or nu). Use --enable-host-links for a host fallback."
@@ -299,9 +338,18 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
         );
     };
 
-    let mut cmd = vec![shell];
-    cmd.extend_from_slice(shell_args);
-    let code = run_in_sandbox(sysroot, &cmd, &[], host_links, true, &[])?;
+    let mut owned: Vec<(String, String)> = Vec::new();
+    if let Some((name, home, sh)) = &session {
+        owned.push(("USER".into(), name.clone()));
+        owned.push(("LOGNAME".into(), name.clone()));
+        owned.push(("HOME".into(), home.clone()));
+        owned.push(("SHELL".into(), sh.clone()));
+    }
+    let envs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let mut cmd: Vec<&str> = vec![shell.as_str()];
+    cmd.extend(shell_args.iter().copied());
+    let code = run_in_sandbox(sysroot, &cmd, &envs, host_links, true, &[])?;
     if code != 0 {
         Err(format!("Shell exited with code {}", code))
     } else {
