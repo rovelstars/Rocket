@@ -61,6 +61,15 @@ fn write_id_maps(
     Ok(())
 }
 
+/// Remove the empty stock-FHS mount points the sandbox leaves in the sysroot
+/// after a build (host-tool binds + /tmp). `remove_dir` only deletes empty
+/// directories, so anything real is left alone.
+fn cleanup_stock_dirs(sysroot: &Path) {
+    for d in ["bin", "sbin", "lib", "lib64", "usr", "opt", "etc", "tmp"] {
+        let _ = std::fs::remove_dir(sysroot.join(d));
+    }
+}
+
 fn bind(src: &Path, dst: &Path, recursive: bool) -> Result<(), String> {
     let mut flags = MsFlags::MS_BIND;
     if recursive {
@@ -244,12 +253,22 @@ fn enter_sandbox(
             }
             unreachable!();
         }
-        ForkResult::Parent { child } => match waitpid(child, None) {
-            Ok(WaitStatus::Exited(_, code)) => Ok(code),
-            Ok(WaitStatus::Signaled(_, sig, _)) => Ok(128 + sig as i32),
-            Ok(_) => Ok(1),
-            Err(e) => Err(format!("waitpid: {}", e)),
-        },
+        ForkResult::Parent { child } => {
+            let r = match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, code)) => Ok(code),
+                Ok(WaitStatus::Signaled(_, sig, _)) => Ok(128 + sig as i32),
+                Ok(_) => Ok(1),
+                Err(e) => Err(format!("waitpid: {}", e)),
+            };
+            // The sandbox creates stock-FHS mount points (host /usr, /bin, ...,
+            // /etc, /tmp) in the real sysroot to bind onto. Once the namespace is
+            // gone they are empty; remove them so the sysroot keeps only the
+            // RunixOS layout. remove_dir only succeeds when empty, so a legit
+            // non-empty dir is never touched. dev/proc/sys are kept (RunixOS
+            // ships those).
+            cleanup_stock_dirs(&sysroot);
+            r
+        }
     }
 }
 
