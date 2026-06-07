@@ -18,6 +18,20 @@ const HOST_NET_FILES: &[&str] = &["/etc/resolv.conf", "/etc/hosts"];
 /// Host trust store, bound only with host links (RunixOS ships its own).
 const HOST_RO_FILES: &[&str] = &["/etc/ssl", "/etc/ca-certificates", "/etc/pki"];
 
+/// Build-time autotools site defaults: map the stock share/libexec/man/doc into
+/// the RunixOS layout (StoreRoom/LibKit) for every `configure`, so no package
+/// needs per-build --datarootdir/--libexecdir flags. `${prefix}` is expanded by
+/// configure once --prefix is known.
+const CONFIG_SITE: &str = "\
+datarootdir='${prefix}/StoreRoom'
+datadir='${prefix}/StoreRoom'
+libexecdir='${prefix}/LibKit'
+mandir='${prefix}/StoreRoom/Manual'
+docdir='${prefix}/StoreRoom/Docs'
+infodir='${prefix}/StoreRoom/Info'
+localedir='${prefix}/StoreRoom/locale'
+";
+
 /// We run unprivileged: a user namespace maps our real uid/gid to root inside,
 /// which lets us chroot + mount without sudo. The kernel tears the namespace
 /// (and all its mounts) down when the process exits, so it is crash-safe and
@@ -171,6 +185,14 @@ pub fn setup_mounts(
     )
     .map_err(|e| format!("tmpfs Transit/Ephemeral: {}", e))?;
 
+    // Autotools config.site: the proper, global way to keep installs out of the
+    // stock $prefix/share and $prefix/libexec. Every autotools `configure` reads
+    // $CONFIG_SITE (set in the sandbox env) and adopts the RunixOS layout
+    // (StoreRoom/LibKit) without per-package flags. Written to the ephemeral
+    // tmpfs so it never persists in the sysroot. The cmake fork already does the
+    // equivalent via its RunixOS platform.
+    let _ = std::fs::write(ephemeral.join("config.site"), CONFIG_SITE);
+
     // A writable /tmp (1777). Host build tools (clang, configure scripts) create
     // temp files in /tmp by default, and the chroot's sysroot has no /tmp of its
     // own. Without this, clang fails with "unable to make temporary file".
@@ -286,6 +308,8 @@ fn do_enter(
         ("HOME".to_string(), "/Vault/Cache/builder".to_string()),
         ("TERM".to_string(), term),
         ("PATH".to_string(), path.to_string()),
+        // Autotools picks up the RunixOS install layout (StoreRoom/LibKit).
+        ("CONFIG_SITE".to_string(), "/Transit/Ephemeral/config.site".to_string()),
     ];
     for (k, v) in envs {
         match pairs.iter_mut().find(|(ek, _)| ek == k) {
