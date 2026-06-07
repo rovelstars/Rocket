@@ -2,5 +2,6 @@
 /local_output
 /build
 /output
-a.outoutput-clean/
+a.out
+output-clean/
 output/
