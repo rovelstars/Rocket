@@ -92,6 +92,19 @@ fn load_all_or_exit(planets: &std::path::Path) -> (Vec<config::Package>, Vec<Str
     }
 }
 
+/// Human-readable elapsed time: "1h 23m 45s", "23m 45s", or "45s".
+fn fmt_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}h {m}m {sec}s")
+    } else if m > 0 {
+        format!("{m}m {sec}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
 /// Build packages in the given order, fail-fast with a summary. `local_for`
 /// supplies an optional local-source override per package name.
 fn build_in_order(
@@ -106,6 +119,7 @@ fn build_in_order(
     use std::collections::HashMap;
     let by_name: HashMap<&str, &config::Package> =
         pkgs.iter().map(|p| (p.meta.name.as_str(), p)).collect();
+    let start = std::time::Instant::now();
     let mut built = 0usize;
     for name in order {
         let Some(pkg) = by_name.get(name.as_str()) else {
@@ -114,20 +128,29 @@ fn build_in_order(
         };
         println!("\n{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
         let loc = local_for(name);
+        let pkg_start = std::time::Instant::now();
         if let Err(e) = builder::build_package(pkg, sysroot, output, loc.as_deref(), install, force) {
             eprintln!("{} {}: {}", "Failed:".red().bold(), name, e);
             eprintln!(
-                "{} built {}/{} before stopping at {}",
+                "{} built {}/{} before stopping at {} (after {})",
                 "Summary:".yellow(),
                 built,
                 order.len(),
-                name
+                name,
+                fmt_duration(start.elapsed())
             );
             std::process::exit(1);
         }
+        println!("  {} in {}", "done".green(), fmt_duration(pkg_start.elapsed()));
         built += 1;
     }
-    println!("\n{} built {}/{} packages", "Done:".green().bold(), built, order.len());
+    println!(
+        "\n{} built {}/{} packages in {}",
+        "Done:".green().bold(),
+        built,
+        order.len(),
+        fmt_duration(start.elapsed())
+    );
 }
 
 fn main() {
@@ -164,11 +187,18 @@ fn main() {
                 match config::load_package(&pkg_dir) {
                     Ok(pkg) => {
                         println!("{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
+                        let t0 = std::time::Instant::now();
                         if let Err(e) = builder::build_package(&pkg, &sysroot, &output, local.as_deref(), install, force) {
                             eprintln!("{} {}", "Build failed:".red().bold(), e);
                             std::process::exit(1);
                         }
-                        println!("{} {} v{}", "Completed".green().bold(), pkg.meta.name, pkg.meta.version);
+                        println!(
+                            "{} {} v{} in {}",
+                            "Completed".green().bold(),
+                            pkg.meta.name,
+                            pkg.meta.version,
+                            fmt_duration(t0.elapsed())
+                        );
                     }
                     Err(e) => {
                         eprintln!("{} Failed to load package: {}", "Error:".red().bold(), e);
