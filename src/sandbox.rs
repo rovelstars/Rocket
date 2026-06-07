@@ -111,11 +111,9 @@ pub fn setup_mounts(
         bind(Path::new(src), &dst, true)?;
     }
 
-    // Always bind network config so DNS resolves for RunixOS's own git/curl.
-    // RunixOS glibc reads /Core/Config/resolv.conf (the patched _PATH_RESCONF),
-    // not /etc/resolv.conf - so the host resolv.conf is bridged there too; the
-    // /etc bind still serves any host-links host binaries.
-    bind_etc_files(sysroot, HOST_NET_FILES)?;
+    // RunixOS itself has no /etc, and its glibc reads /Core/Config/resolv.conf
+    // (the patched _PATH_RESCONF). So bridge the host DNS there for RunixOS's own
+    // git/curl - no /etc involved.
     let host_resolv = Path::new("/etc/resolv.conf");
     if host_resolv.exists() {
         let dst = sysroot.join("Core/Config/resolv.conf");
@@ -126,6 +124,18 @@ pub fn setup_mounts(
             let _ = std::fs::File::create(&dst);
         }
         let _ = bind_ro(host_resolv, &dst);
+    }
+
+    // Host build tools (gcc/git/curl) hardcode /etc paths, so under host-links we
+    // still need /etc - but mount it on a tmpfs so nothing the sandbox writes
+    // there persists on the real sysroot (it leaves only an empty /etc mount
+    // point, never a tree of stub files, and never touches a non-host-links run).
+    if host_links {
+        let etc = sysroot.join("etc");
+        std::fs::create_dir_all(&etc).map_err(|e| format!("mkdir etc: {}", e))?;
+        mount(Some("tmpfs"), &etc, Some("tmpfs"), MsFlags::empty(), Some("size=4M"))
+            .map_err(|e| format!("tmpfs /etc: {}", e))?;
+        bind_etc_files(sysroot, HOST_NET_FILES)?;
     }
 
     if host_links {
