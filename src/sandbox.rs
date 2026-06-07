@@ -33,12 +33,17 @@ fn write_id_maps(
     // `inside_*` is the uid/gid the process holds inside the namespace: 0 (root)
     // for builds/OOBE, or the logged-in user's id for an interactive session so
     // it actually runs as that account (whoami, file ownership, ...).
-    std::fs::write("/proc/self/setgroups", "deny")
-        .map_err(|e| format!("setgroups deny: {}", e))?;
-    std::fs::write("/proc/self/uid_map", format!("{} {} 1", inside_uid, host_uid))
-        .map_err(|e| format!("uid_map: {}", e))?;
-    std::fs::write("/proc/self/gid_map", format!("{} {} 1", inside_gid, host_gid))
-        .map_err(|e| format!("gid_map: {}", e))?;
+    std::fs::write("/proc/self/setgroups", "deny").map_err(|e| format!("setgroups deny: {}", e))?;
+    std::fs::write(
+        "/proc/self/uid_map",
+        format!("{} {} 1", inside_uid, host_uid),
+    )
+    .map_err(|e| format!("uid_map: {}", e))?;
+    std::fs::write(
+        "/proc/self/gid_map",
+        format!("{} {} 1", inside_gid, host_gid),
+    )
+    .map_err(|e| format!("gid_map: {}", e))?;
     Ok(())
 }
 
@@ -107,7 +112,21 @@ pub fn setup_mounts(
     }
 
     // Always bind network config so DNS resolves for RunixOS's own git/curl.
+    // RunixOS glibc reads /Core/Config/resolv.conf (the patched _PATH_RESCONF),
+    // not /etc/resolv.conf - so the host resolv.conf is bridged there too; the
+    // /etc bind still serves any host-links host binaries.
     bind_etc_files(sysroot, HOST_NET_FILES)?;
+    let host_resolv = Path::new("/etc/resolv.conf");
+    if host_resolv.exists() {
+        let dst = sysroot.join("Core/Config/resolv.conf");
+        if let Some(p) = dst.parent() {
+            std::fs::create_dir_all(p).ok();
+        }
+        if !dst.exists() {
+            let _ = std::fs::File::create(&dst);
+        }
+        let _ = bind_ro(host_resolv, &dst);
+    }
 
     if host_links {
         for dir in HOST_RO_DIRS {
@@ -297,7 +316,15 @@ pub fn run_in_sandbox_as(
     uid: u32,
     gid: u32,
 ) -> Result<i32, String> {
-    enter_sandbox(sysroot, cmd, envs, host_links, true, binds, Some((uid, gid)))
+    enter_sandbox(
+        sysroot,
+        cmd,
+        envs,
+        host_links,
+        true,
+        binds,
+        Some((uid, gid)),
+    )
 }
 
 /// True when the account store has no human (uid >= 1000) account yet. Read from
@@ -369,7 +396,11 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
         .filter(|s| s.starts_with('/') && sysroot.join(s.trim_start_matches('/')).exists());
 
     let (shell, shell_args): (String, Vec<&str>) = if let Some(s) = user_shell {
-        let args = if s.ends_with("/nu") { vec![] } else { vec!["--login", "-i"] };
+        let args = if s.ends_with("/nu") {
+            vec![]
+        } else {
+            vec!["--login", "-i"]
+        };
         (s, args)
     } else if sysroot.join("Core/Bin/brush").exists() {
         ("/Core/Bin/brush".to_string(), vec!["--login", "-i"])
@@ -391,7 +422,10 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
         owned.push(("HOME".into(), home.clone()));
         owned.push(("SHELL".into(), sh.clone()));
     }
-    let envs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let envs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let mut cmd: Vec<&str> = vec![shell.as_str()];
     cmd.extend(shell_args.iter().copied());
