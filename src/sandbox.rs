@@ -23,13 +23,21 @@ const HOST_RO_FILES: &[&str] = &["/etc/ssl", "/etc/ca-certificates", "/etc/pki"]
 /// (and all its mounts) down when the process exits, so it is crash-safe and
 /// never touches the host. proot/ptrace is not used (it would trap every
 /// syscall and cripple compile-heavy builds); chroot is native speed.
-fn write_id_maps(uid: u32, gid: u32) -> Result<(), String> {
+fn write_id_maps(
+    inside_uid: u32,
+    inside_gid: u32,
+    host_uid: u32,
+    host_gid: u32,
+) -> Result<(), String> {
     // setgroups must be denied before gid_map can be written unprivileged.
+    // `inside_*` is the uid/gid the process holds inside the namespace: 0 (root)
+    // for builds/OOBE, or the logged-in user's id for an interactive session so
+    // it actually runs as that account (whoami, file ownership, ...).
     std::fs::write("/proc/self/setgroups", "deny")
         .map_err(|e| format!("setgroups deny: {}", e))?;
-    std::fs::write("/proc/self/uid_map", format!("0 {} 1", uid))
+    std::fs::write("/proc/self/uid_map", format!("{} {} 1", inside_uid, host_uid))
         .map_err(|e| format!("uid_map: {}", e))?;
-    std::fs::write("/proc/self/gid_map", format!("0 {} 1", gid))
+    std::fs::write("/proc/self/gid_map", format!("{} {} 1", inside_gid, host_gid))
         .map_err(|e| format!("gid_map: {}", e))?;
     Ok(())
 }
@@ -166,19 +174,20 @@ fn enter_sandbox(
     host_links: bool,
     interactive: bool,
     binds: &[(std::path::PathBuf, String)],
+    login: Option<(u32, u32)>,
 ) -> Result<i32, String> {
     let sysroot = sysroot_raw
         .canonicalize()
         .map_err(|e| format!("canonicalize sysroot {:?}: {}", sysroot_raw, e))?;
 
     if interactive {
-        do_enter(&sysroot, cmd, envs, host_links, binds)?;
+        do_enter(&sysroot, cmd, envs, host_links, binds, login)?;
         unreachable!();
     }
 
     match unsafe { fork() }.map_err(|e| format!("fork: {}", e))? {
         ForkResult::Child => {
-            if let Err(e) = do_enter(&sysroot, cmd, envs, host_links, binds) {
+            if let Err(e) = do_enter(&sysroot, cmd, envs, host_links, binds, login) {
                 eprintln!("sandbox child: {}", e);
                 std::process::exit(127);
             }
@@ -201,6 +210,7 @@ fn do_enter(
     envs: &[(&str, &str)],
     host_links: bool,
     binds: &[(std::path::PathBuf, String)],
+    login: Option<(u32, u32)>,
 ) -> Result<i32, String> {
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
@@ -208,7 +218,11 @@ fn do_enter(
     // User namespace (so we can chroot+mount unprivileged) + mount + UTS.
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
         .map_err(|e| format!("unshare (unprivileged user namespaces enabled?): {}", e))?;
-    write_id_maps(uid, gid)?;
+    // Builds/OOBE run as inside-root (0); an interactive login runs as the
+    // account's uid/gid. The namespace creator keeps full caps either way, so
+    // chroot+mount still work even when inside-uid is non-zero.
+    let (in_uid, in_gid) = login.unwrap_or((0, 0));
+    write_id_maps(in_uid, in_gid, uid, gid)?;
 
     // Make all mounts private so our binds never propagate back to the host.
     mount(
@@ -269,7 +283,21 @@ pub fn run_in_sandbox(
     interactive: bool,
     binds: &[(std::path::PathBuf, String)],
 ) -> Result<i32, String> {
-    enter_sandbox(sysroot, cmd, envs, host_links, interactive, binds)
+    enter_sandbox(sysroot, cmd, envs, host_links, interactive, binds, None)
+}
+
+/// Run an interactive session in the sandbox as a specific account (inside
+/// uid/gid), so it truly runs as that user. Used for the post-OOBE login.
+pub fn run_in_sandbox_as(
+    sysroot: &Path,
+    cmd: &[&str],
+    envs: &[(&str, &str)],
+    host_links: bool,
+    binds: &[(std::path::PathBuf, String)],
+    uid: u32,
+    gid: u32,
+) -> Result<i32, String> {
+    enter_sandbox(sysroot, cmd, envs, host_links, true, binds, Some((uid, gid)))
 }
 
 /// True when the account store has no human (uid >= 1000) account yet. Read from
@@ -286,15 +314,22 @@ fn needs_oobe(sysroot: &Path) -> bool {
     }
 }
 
-/// First human account from the passwd projection: (name, home, shell).
-fn session_user(sysroot: &Path) -> Option<(String, String, String)> {
+/// First human account from the passwd projection: (name, uid, gid, home, shell).
+fn session_user(sysroot: &Path) -> Option<(String, u32, u32, String, String)> {
     let content = std::fs::read_to_string(sysroot.join("Vault/Accounts/passwd")).ok()?;
     for line in content.lines() {
         let f: Vec<&str> = line.split(':').collect();
         if f.len() >= 7 {
             if let Ok(uid) = f[2].parse::<u32>() {
                 if uid >= 1000 {
-                    return Some((f[0].to_string(), f[5].to_string(), f[6].to_string()));
+                    let gid = f[3].parse::<u32>().unwrap_or(uid);
+                    return Some((
+                        f[0].to_string(),
+                        uid,
+                        gid,
+                        f[5].to_string(),
+                        f[6].to_string(),
+                    ));
                 }
             }
         }
@@ -325,11 +360,12 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
         run_in_sandbox(sysroot, &["/Core/Bin/oobe"], &[], host_links, false, &[])?;
     }
 
-    // Session: log in as the human account (environment + their login shell).
+    // Session: log in as the human account (environment + their login shell),
+    // running as that account's uid/gid (not root).
     let session = session_user(sysroot);
     let user_shell = session
         .as_ref()
-        .map(|(_, _, s)| s.clone())
+        .map(|(_, _, _, _, s)| s.clone())
         .filter(|s| s.starts_with('/') && sysroot.join(s.trim_start_matches('/')).exists());
 
     let (shell, shell_args): (String, Vec<&str>) = if let Some(s) = user_shell {
@@ -349,7 +385,7 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
     };
 
     let mut owned: Vec<(String, String)> = Vec::new();
-    if let Some((name, home, sh)) = &session {
+    if let Some((name, _, _, home, sh)) = &session {
         owned.push(("USER".into(), name.clone()));
         owned.push(("LOGNAME".into(), name.clone()));
         owned.push(("HOME".into(), home.clone()));
@@ -359,7 +395,14 @@ pub fn enter_interactive(sysroot: &Path, host_links: bool) -> Result<(), String>
 
     let mut cmd: Vec<&str> = vec![shell.as_str()];
     cmd.extend(shell_args.iter().copied());
-    let code = run_in_sandbox(sysroot, &cmd, &envs, host_links, true, &[])?;
+    // Run the session as the account (so whoami, $HOME ownership, etc. are the
+    // user). Without a human account (host-links fallback), stay inside-root.
+    let code = match &session {
+        Some((_, uid, gid, _, _)) => {
+            run_in_sandbox_as(sysroot, &cmd, &envs, host_links, &[], *uid, *gid)?
+        }
+        None => run_in_sandbox(sysroot, &cmd, &envs, host_links, true, &[])?,
+    };
     if code != 0 {
         Err(format!("Shell exited with code {}", code))
     } else {
