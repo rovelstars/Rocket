@@ -1,51 +1,80 @@
 # Rocket
 
-Rocket is a Rust based CLI tool for building packages for RunixOS.
-The name "Rocket" is inspired by the whole Universe System, where each planet is a package and the rocket is the tool that helps us manage them.
+Rocket is the build system for **RunixOS** - a Rust CLI that builds RunixOS and
+its packages. The name comes from the Universe System: each package is a
+"planet" and Rocket is the tool that carries them.
+
+Rocket builds RunixOS **from any Linux host** (to bootstrap it the first time)
+and **on RunixOS itself** (RunixOS is self-hosting - it rebuilds its own
+toolchain and userspace with zero non-RunixOS tools). It targets RunixOS only;
+it is not a general-purpose, build-anywhere-for-anything system.
 
 ## How it works
 
-Rocket uses Linux namespaces to create isolated build sandboxes, no Docker required. Builds can run in two modes:
+Rocket builds each package in an isolated sandbox using unprivileged Linux
+namespaces (user + mount) and `chroot` into the RunixOS sysroot - **no Docker,
+no daemon, no root required**. The kernel tears the namespace (and its mounts)
+down when the build exits, so it is crash-safe and never touches the host.
 
-1. **Root mode** (recommended): Uses `chroot` with mount/PID namespaces for full isolation. Mount changes are private to the sandbox and automatically cleaned up by the kernel when the process exits.
-2. **Non-root mode**: Sets up environment variables and paths so tools find the RunixOS sysroot. Supports cross-compilation from a regular Linux host.
+Two build modes:
+
+1. **Cross-bootstrap** (default): the host's tools (clang, make, cmake, curl,
+   ...) are bind-mounted read-only to drive the build, while the RunixOS cross
+   toolchain in the sysroot (`/Core/Bin/clang --target=...-runixos`) emits
+   RunixOS code. Used to bring up a RunixOS sysroot from a foreign Linux host.
+2. **Self-hosted** (`--self-hosted`): no host tools are bound in at all - the
+   build uses only the RunixOS-native toolchain and build environment already in
+   the sysroot. This is how RunixOS rebuilds itself, and the hermetic path for
+   reproducible builds.
 
 ## Package structure
 
-Packages are defined in a separate repository ([Planets](https://github.com/rovelstars/Planets)). Each package has:
+Packages live in a separate repository ([Planets](https://github.com/rovelstars/Planets)).
+Each package has:
 
 ```
 package_name/
   meta.toml    # package metadata
-  build.sh     # build script with configure/build/install functions
+  build.sh     # configure/build/install shell functions
   patches/     # (optional) patch files
 ```
 
-The `build.sh` script defines three shell functions: `configure()`, `build()`, and `install()`. Rocket sources the script and calls each function in order. Environment variables like `$SYSROOT`, `$OUTPUT`, `$SRC`, `$VERSION`, `$REPOSITORY`, and `$JOBS` are provided automatically.
+Rocket sources `build.sh` and calls `configure()`, `build()`, `install()` in
+order. It provides `$SYSROOT`, `$OUTPUT`, `$SRC`, `$VERSION`, `$REPOSITORY`,
+`$BRANCH`, `$JOBS`, and any extra `meta.toml` fields as uppercase env vars.
 
 ## Usage
 
 ```sh
-# Build a package
-rocket build <package> --planets <path-to-planets> --output <output-dir> --sysroot <sysroot-path>
+# Build one package (and install it into the sysroot for later packages)
+rocket build <package> --install
 
-# Build all packages
-rocket build-all --planets <path-to-planets> --output <output-dir> --sysroot <sysroot-path>
+# Build it with zero host tools (RunixOS self-hosting / hermetic)
+rocket build <package> --self-hosted --install
 
-# Enter the RunixOS sandbox interactively
-rocket enter --sysroot <sysroot-path>
+# Build every package in dependency order
+rocket build-all
 
-# Enter with host tools available (for debugging)
-rocket enter --sysroot <sysroot-path> --enable-host-links
+# Print the resolved dependency build order
+rocket deps
+
+# Enter the RunixOS sandbox interactively (--enable-host-links for host tools)
+rocket enter
 
 # List available packages
-rocket list --planets <path-to-planets>
+rocket list
 ```
 
-Root mode is used automatically when run with `sudo`. Otherwise, non-root mode is used with cross-compilation environment variables.
+Defaults: `--planets ../Planets`, `--output ./output`, `--sysroot /home/ren/ROS`.
 
-## Cross-compilation
+## Target
 
-Rocket sets up the cross-compilation environment for RunixOS (`x86_64-rovelstars-runixos`) automatically. For Rust packages, it configures `RUSTC`, `CARGO_TARGET_*_RUSTFLAGS`, `CC`, `CXX`, and `CFLAGS` so that `cargo build --target x86_64-rovelstars-runixos` works out of the box.
+RunixOS uses the triple `x86_64-rovelstars-linux-runixos` (glibc + Linux ABI;
+RunixOS identity via the `rovelstars` vendor and `runixos` environment). The
+toolchain is all-LLVM: clang, lld, and the LLVM binutils - no gcc, no GNU
+binutils.
 
-For C packages, build scripts should use `$SYSROOT/Core/Bin/clang` with `--target=x86_64-rovelstars-runixos --sysroot=$SYSROOT` flags.
+For C packages, build scripts compile with
+`$SYSROOT/Core/Bin/clang --target=x86_64-rovelstars-linux-runixos --sysroot=$SYSROOT`.
+Rust packages `cargo build --target x86_64-rovelstars-linux-runixos` against the
+RunixOS Rust toolchain in the sysroot.
