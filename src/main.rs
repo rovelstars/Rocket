@@ -43,6 +43,10 @@ enum Command {
         /// Rebuild even if the build cache says it is unchanged.
         #[arg(long)]
         force: bool,
+        /// Build using ONLY the sysroot-native tools (no host /usr, /bin binds).
+        /// Proves the RunixOS build environment is self-contained.
+        #[arg(long)]
+        self_hosted: bool,
     },
     /// Build all packages
     BuildAll {
@@ -59,6 +63,9 @@ enum Command {
         /// Rebuild every package, ignoring the build cache.
         #[arg(long)]
         force: bool,
+        /// Build using ONLY the sysroot-native tools (no host /usr, /bin binds).
+        #[arg(long)]
+        self_hosted: bool,
     },
     /// List available packages
     List {
@@ -114,6 +121,7 @@ fn build_in_order(
     output: &std::path::Path,
     install: bool,
     force: bool,
+    self_hosted: bool,
     local_for: impl Fn(&str) -> Option<PathBuf>,
 ) {
     use std::collections::HashMap;
@@ -129,7 +137,7 @@ fn build_in_order(
         println!("\n{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
         let loc = local_for(name);
         let pkg_start = std::time::Instant::now();
-        if let Err(e) = builder::build_package(pkg, sysroot, output, loc.as_deref(), install, force) {
+        if let Err(e) = builder::build_package(pkg, sysroot, output, loc.as_deref(), install, force, self_hosted) {
             eprintln!("{} {}: {}", "Failed:".red().bold(), name, e);
             eprintln!(
                 "{} built {}/{} before stopping at {} (after {})",
@@ -157,7 +165,7 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { package, planets, output, sysroot, local, with_deps, install, force } => {
+        Command::Build { package, planets, output, sysroot, local, with_deps, install, force, self_hosted } => {
             if with_deps {
                 // Build the dependency closure in order; the target builds last.
                 let (pkgs, errors) = load_all_or_exit(&planets);
@@ -175,7 +183,7 @@ fn main() {
                 // Dependencies must be installed into the sysroot so the target
                 // can build against them, so a closure build always installs.
                 // local override only applies to the named target, not its deps.
-                build_in_order(&pkgs, &order, &sysroot, &output, true, force, |n| {
+                build_in_order(&pkgs, &order, &sysroot, &output, true, force, self_hosted, |n| {
                     if n == package { local.clone() } else { None }
                 });
             } else {
@@ -188,7 +196,7 @@ fn main() {
                     Ok(pkg) => {
                         println!("{} {} v{}", "Building".green().bold(), pkg.meta.name, pkg.meta.version);
                         let t0 = std::time::Instant::now();
-                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, local.as_deref(), install, force) {
+                        if let Err(e) = builder::build_package(&pkg, &sysroot, &output, local.as_deref(), install, force, self_hosted) {
                             eprintln!("{} {}", "Build failed:".red().bold(), e);
                             std::process::exit(1);
                         }
@@ -207,7 +215,7 @@ fn main() {
                 }
             }
         }
-        Command::BuildAll { planets, output, sysroot, no_install, force } => {
+        Command::BuildAll { planets, output, sysroot, no_install, force, self_hosted } => {
             let (pkgs, errors) = load_all_or_exit(&planets);
             for e in &errors {
                 eprintln!("{} {}", "Skip:".yellow(), e);
@@ -220,7 +228,7 @@ fn main() {
                 }
             };
             println!("{} {} packages in dependency order", "Building".green().bold(), order.len());
-            build_in_order(&pkgs, &order, &sysroot, &output, !no_install, force, |_| None);
+            build_in_order(&pkgs, &order, &sysroot, &output, !no_install, force, self_hosted, |_| None);
         }
         Command::Deps { packages, planets } => {
             let (pkgs, errors) = load_all_or_exit(&planets);

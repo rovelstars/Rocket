@@ -15,6 +15,7 @@ pub fn build_package(
     local_src: Option<&Path>,
     install_to_sysroot: bool,
     force: bool,
+    self_hosted: bool,
 ) -> Result<(), String> {
     // Create output directory
     std::fs::create_dir_all(output)
@@ -138,11 +139,30 @@ pub fn build_package(
         src = src_path, out = out_path
     );
 
+    // Self-hosted: build with ONLY the sysroot-native tools (no host /usr, /bin
+    // binds). This proves the RunixOS build environment is self-contained.
+    // Default: bind host tools to drive the cross build.
+    //
+    // make and configure scripts hardcode /bin/sh, which a no-host-links sysroot
+    // lacks, so ensure /bin/sh -> the native bash (/Core/Bin/sh). bash is used
+    // rather than brush as the build shell: configure/cmake-generated scripts are
+    // far more bash-tested.
+    let (shell, host_links): (&str, bool) = if self_hosted {
+        let bin = sysroot.join("bin");
+        let _ = std::fs::create_dir_all(&bin);
+        let sh = bin.join("sh");
+        if !sh.exists() {
+            let _ = std::os::unix::fs::symlink("/Core/Bin/sh", &sh);
+        }
+        ("/Core/Bin/sh", false)
+    } else {
+        ("/bin/sh", true)
+    };
     let code = sandbox::run_in_sandbox(
         sysroot,
-        &["/bin/sh", "-e", "-c", &build_cmd],
+        &[shell, "-e", "-c", &build_cmd],
         &env_refs,
-        true,  // builds need host tools (gcc, make, cmake, curl) bound in
+        host_links,
         false, // non-interactive: fork so we regain control to copy artifacts
         &binds,
     )?;
