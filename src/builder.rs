@@ -147,14 +147,24 @@ pub fn build_package(
     // lacks, so ensure /bin/sh -> the native bash (/Core/Bin/sh). bash is used
     // rather than brush as the build shell: configure/cmake-generated scripts are
     // far more bash-tested.
+    // Two shells, kept distinct: the OUTER shell sources build.sh + runs its
+    // functions (bash - build.sh uses `source` and may use bash features), while
+    // /bin/sh is what configure runs its pipelines under (dash). dash is the lean
+    // POSIX sh autotools is tested against; our bash retains pipeline pipe fds and
+    // deadlocks `clang -E | grep` on >64KB output, brush is less complete - dash
+    // sidesteps both (brush stays the OS shell).
     let (shell, host_links): (&str, bool) = if self_hosted {
         let bin = sysroot.join("bin");
         let _ = std::fs::create_dir_all(&bin);
         let sh = bin.join("sh");
-        if !sh.exists() {
-            let _ = std::os::unix::fs::symlink("/Core/Bin/sh", &sh);
-        }
-        ("/Core/Bin/sh", false)
+        let _ = std::fs::remove_file(&sh);
+        let target = if sysroot.join("Core/Bin/dash").exists() {
+            "/Core/Bin/dash"
+        } else {
+            "/Core/Bin/sh"
+        };
+        let _ = std::os::unix::fs::symlink(target, &sh);
+        ("/Core/Bin/bash", false)
     } else {
         ("/bin/sh", true)
     };
