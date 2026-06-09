@@ -8,10 +8,24 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "rocket", about = "RunixOS package builder")]
+#[command(name = "rocket", version, about = "RunixOS package builder")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Paths shared by the build subcommands.
+#[derive(clap::Args, Debug)]
+struct BuildPaths {
+    /// Path to Planets repository
+    #[arg(short, long, default_value = "../Planets")]
+    planets: PathBuf,
+    /// Output directory for built artifacts
+    #[arg(short, long, default_value = "./output")]
+    output: PathBuf,
+    /// Path to RunixOS sysroot (build environment)
+    #[arg(short, long, default_value = "/home/ren/ROS")]
+    sysroot: PathBuf,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -20,15 +34,8 @@ enum Command {
     Build {
         /// Package name (directory in packages/)
         package: String,
-        /// Path to Planets repository
-        #[arg(short, long, default_value = "../Planets")]
-        planets: PathBuf,
-        /// Output directory for built artifacts
-        #[arg(short, long, default_value = "./output")]
-        output: PathBuf,
-        /// Path to RunixOS sysroot (build environment)
-        #[arg(short, long, default_value = "/home/ren/ROS")]
-        sysroot: PathBuf,
+        #[command(flatten)]
+        paths: BuildPaths,
         /// Build a local working tree instead of cloning upstream
         /// (overrides meta.toml `local_path`). Exposed to build.sh as $LOCAL_SRC.
         #[arg(short, long)]
@@ -50,12 +57,8 @@ enum Command {
     },
     /// Build all packages
     BuildAll {
-        #[arg(short, long, default_value = "../Planets")]
-        planets: PathBuf,
-        #[arg(short, long, default_value = "./output")]
-        output: PathBuf,
-        #[arg(short, long, default_value = "/home/ren/ROS")]
-        sysroot: PathBuf,
+        #[command(flatten)]
+        paths: BuildPaths,
         /// Do not install each package into the sysroot between builds.
         /// (Inter-package dependencies will not resolve; for debugging only.)
         #[arg(long)]
@@ -165,7 +168,7 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { package, planets, output, sysroot, local, with_deps, install, force, self_hosted } => {
+        Command::Build { package, paths: BuildPaths { planets, output, sysroot }, local, with_deps, install, force, self_hosted } => {
             if with_deps {
                 // Build the dependency closure in order; the target builds last.
                 let (pkgs, errors) = load_all_or_exit(&planets);
@@ -215,7 +218,7 @@ fn main() {
                 }
             }
         }
-        Command::BuildAll { planets, output, sysroot, no_install, force, self_hosted } => {
+        Command::BuildAll { paths: BuildPaths { planets, output, sysroot }, no_install, force, self_hosted } => {
             let (pkgs, errors) = load_all_or_exit(&planets);
             for e in &errors {
                 eprintln!("{} {}", "Skip:".yellow(), e);
@@ -250,8 +253,11 @@ fn main() {
         }
         Command::List { planets } => {
             let pkgs_dir = planets.join("packages");
-            let mut entries: Vec<_> = std::fs::read_dir(&pkgs_dir)
-                .expect("Cannot read packages directory")
+            let read = std::fs::read_dir(&pkgs_dir).unwrap_or_else(|e| {
+                eprintln!("{} cannot read {:?}: {}", "Error:".red().bold(), pkgs_dir, e);
+                std::process::exit(1);
+            });
+            let mut entries: Vec<_> = read
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .collect();
