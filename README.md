@@ -78,3 +78,35 @@ For C packages, build scripts compile with
 `$SYSROOT/Core/Bin/clang --target=x86_64-rovelstars-linux-runixos --sysroot=$SYSROOT`.
 Rust packages `cargo build --target x86_64-rovelstars-linux-runixos` against the
 RunixOS Rust toolchain in the sysroot.
+
+## Pros
+
+- **No root, no Docker, no daemon.** Unprivileged user+mount namespaces; the
+  kernel tears the sandbox (and its mounts) down on exit, so builds are
+  crash-safe and never mutate the host.
+- **One tool, two honest modes.** Cross-bootstrap from any Linux host, and a
+  hermetic `--self-hosted` mode that proves RunixOS rebuilds itself with zero
+  foreign tools.
+- **Simple package model.** A `meta.toml` + a `build.sh` with three functions;
+  dependency build order resolved automatically; local-fork override for
+  in-development sources.
+- All-LLVM, single target triple -- no gcc/GNU-binutils ambiguity.
+
+## Cons / tradeoffs
+
+- **RunixOS-only by design** -- not a general-purpose, build-anything system.
+- `build.sh` recipes are shell, not a declarative/sandboxed DSL -- expressive but
+  easy to write host-leaking or non-reproducible steps.
+- Namespace approach is **Linux-only** and depends on unprivileged user
+  namespaces being enabled on the host.
+
+## Known issues / limitations
+
+- **No package format yet** -- Rocket installs build output into the sysroot /
+  output dir; there are no shippable, signed package archives or a binary cache,
+  so every build is from source.
+- Dependency resolution is basic (order from `dependencies`); no version
+  constraints, no parallel multi-package builds.
+- Defaults are developer-centric (e.g. a hardcoded default `--sysroot`).
+- A solid MVP, not yet best-in-class: see the backlog for native/cross-mode
+  ergonomics and packaging gaps.
