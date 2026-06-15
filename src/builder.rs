@@ -300,6 +300,13 @@ pub fn emit_package_manifest(meta: &crate::config::PackageMeta, pkg_output: &Pat
         .get("build_only")
         .and_then(|v| v.as_bool())
         .unwrap_or_else(|| build_only_heuristic(&meta.name));
+    // A meta-package (base-image) is a union of other packages' files; flag it so
+    // dependency resolution picks the real owning package, not the union.
+    let is_meta = meta
+        .extra
+        .get("meta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(meta.name == "base-image");
     let manifest = runix_package_format::scan::scan_core(
         &core,
         &meta.name,
@@ -307,6 +314,7 @@ pub fn emit_package_manifest(meta: &crate::config::PackageMeta, pkg_output: &Pat
         &meta.description,
         meta.dependencies.clone(),
         build_only,
+        is_meta,
     )
     .map_err(|e| format!("scan package manifest: {}", e))?;
     std::fs::write(pkg_output.join("package.json"), manifest.to_json())
