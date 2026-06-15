@@ -191,6 +191,11 @@ pub fn build_package(
         copy_dir_recursive(&out_dir, &pkg_output)?;
         println!("  Output: {:?}", pkg_output);
 
+        // Provenance: emit a package manifest (files + hashes + ELF needs) next
+        // to the output, so RuneForge composes by package set + dependency
+        // closure instead of merging blind trees.
+        emit_package_manifest(&pkg.meta, &pkg_output)?;
+
         // Merge the output into the sysroot so packages built later in a
         // dependency-ordered run can find this package's headers and libraries
         // (e.g. curl needs openssl in Core/LibKit + Core/APIHeader). Without
@@ -283,4 +288,45 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Write `package.json` (a runix-package-format manifest) beside a package's
+/// output, recording every file with its content hash + ELF needs so RuneForge
+/// can compose by package set + dependency closure.
+pub fn emit_package_manifest(meta: &crate::config::PackageMeta, pkg_output: &Path) -> Result<(), String> {
+    let core = pkg_output.join("Core");
+    let build_only = meta
+        .extra
+        .get("build_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| build_only_heuristic(&meta.name));
+    let manifest = runix_package_format::scan::scan_core(
+        &core,
+        &meta.name,
+        &meta.version,
+        &meta.description,
+        meta.dependencies.clone(),
+        build_only,
+    )
+    .map_err(|e| format!("scan package manifest: {}", e))?;
+    std::fs::write(pkg_output.join("package.json"), manifest.to_json())
+        .map_err(|e| format!("write package.json: {}", e))?;
+    println!(
+        "  Manifest: {} files{}",
+        manifest.files.len(),
+        if build_only { " (build-only)" } else { "" }
+    );
+    Ok(())
+}
+
+/// Toolchains and headers are build-only (never shipped in a runtime /Core).
+/// Runtime libraries (e.g. llvm-runtimes -> libunwind) are NOT build-only.
+/// Overridable per package via `build_only = true` in meta.toml.
+fn build_only_heuristic(name: &str) -> bool {
+    name.ends_with("-native")
+        || matches!(
+            name,
+            "llvm" | "llvm21" | "compiler-rt" | "cmake-native" | "kernel-headers"
+                | "glibc-headers" | "rust" | "lmtest"
+        )
 }

@@ -82,6 +82,14 @@ enum Command {
         #[arg(short, long, default_value = "../Planets")]
         planets: PathBuf,
     },
+    /// (Re)generate package.json provenance manifests for already-built outputs
+    /// (files + hashes + ELF needs), without rebuilding.
+    Manifest {
+        #[arg(short, long, default_value = "../Planets")]
+        planets: PathBuf,
+        #[arg(short, long, default_value = "./output")]
+        output: PathBuf,
+    },
     /// Enter the RunixOS sandbox interactively
     Enter {
         #[arg(short, long, default_value = "/home/ren/ROS")]
@@ -271,6 +279,24 @@ fn main() {
                         pkg.meta.description);
                 }
             }
+        }
+        Command::Manifest { planets, output } => {
+            let (pkgs, _errs) = load_all_or_exit(&planets);
+            let mut n = 0;
+            for pkg in &pkgs {
+                let pkg_output = output.join(&pkg.meta.name);
+                if !pkg_output.join("Core").is_dir() {
+                    continue;
+                }
+                match builder::emit_package_manifest(&pkg.meta, &pkg_output) {
+                    Ok(()) => {
+                        println!("  {} {}", "manifest".green(), pkg.meta.name);
+                        n += 1;
+                    }
+                    Err(e) => eprintln!("  {} {}: {}", "Error:".red().bold(), pkg.meta.name, e),
+                }
+            }
+            println!("Wrote {} package manifests under {:?}", n, output);
         }
         Command::Enter { sysroot, enable_host_links } => {
             println!("{} RunixOS sandbox at {:?}{}", "Entering".cyan().bold(), sysroot,

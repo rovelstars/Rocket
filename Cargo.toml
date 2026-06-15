@@ -10,3 +10,6 @@ colored = "3.0"
 nix = { version = "0.30", features = ["sched", "mount", "hostname", "signal", "fs", "process", "user"] }
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }
+# Emit a per-package provenance manifest (files + hashes + ELF needs) that
+# RuneForge composes from, instead of leaving plain trees.
+runix-package-format = { path = "../RunixUpdateManager/package-format" }
