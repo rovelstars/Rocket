@@ -96,6 +96,26 @@ pub fn build_package(
         println!("  Local source: {}", ls);
     }
 
+    // Sibling source repos a workspace package path-depends on (e.g. RevKit
+    // path-deps ../RookGuard, ../UAC, ../WireBus). meta.toml `sibling_paths`
+    // lists them relative to the package dir; each host tree is bound next to the
+    // package's src (Transit/Build/<pkg>/<basename>) so its `../<repo>` Cargo
+    // path deps resolve inside the chroot.
+    if let Some(toml::Value::Array(sibs)) = pkg.meta.extra.get("sibling_paths") {
+        for s in sibs {
+            let Some(rel) = s.as_str() else { continue };
+            let host = pkg.pkg_dir.join(rel);
+            match host.canonicalize() {
+                Ok(canon) => {
+                    let base = canon.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    binds.push((canon, format!("Transit/Build/{}/{}", pkg.meta.name, base)));
+                    println!("  Sibling: {}", base);
+                }
+                Err(_) => eprintln!("  warning: sibling_paths {:?} not found; skipping", rel),
+            }
+        }
+    }
+
     // Build environment variables from meta.toml. SYSROOT is "/" because the
     // build is chroot'd into the sysroot, so $SYSROOT/Core/Bin/clang etc resolve.
     let mut envs: Vec<(String, String)> = vec![
